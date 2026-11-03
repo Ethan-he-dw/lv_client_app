@@ -1,204 +1,204 @@
-# 改造路线 v2：稳定客户端 + FaceResult 接入（含嗅探握手）
+# 改造路线 v3：砍掉自定义嗅探，回到框架原生
 
-> 日期：2026-11-03 ｜ 版本：v2（按三条新约束重写接入方案）
-> 依据：本项目源码现状 + `PC客户端订阅FaceResult-对接文档-20261103.md` + 2026-11-03 需求澄清
+> 日期：2026-11-03 ｜ 版本：v3
+> 依据：本项目源码 + `PC客户端订阅FaceResult-对接文档-20261103.md` + `OmniBinder/docs/api-reference.md` + 2026-11-03 需求澄清
 >
-> v2 相对 v1 的变化：
-> ① 明确 **OmniBinder 的架构注定异步**，三处线程边界写进设计；
-> ② 嗅探接口由**你来实现**，PC 侧只做协议对接，因此先冻结契约；
-> ③ 嗅探**循环间断连接**，且**返回支持的码流列表**，需与当前播放流比对确认"内容相同"；
-> ④ **订阅不成功不进入后续流程**（资源惰性创建）；
-> ⑤ 删除 v1 的「多路 channel」「FrameReady 双订阅」两节 —— 单 Play 页 + 不同步，均不成立。
+> **v3 相对 v2 的核心变化：删掉整个自定义嗅探协议（probe / streams 列表 / 码流匹配）。**
+> 理由：框架已有 `lookupService` / `queryPublishedTopics` / `subscribeTopic` 三个权威接口，再做一层 TCP 协议纯属重复建设。
+> 副作用：主方案从 **B（bridge）翻回 A（原生客户端）** —— 因为"起没起"的判定本身就是框架 API，只有原生客户端能调（§3）。
 
 ---
 
-## 0. 一页结论
+## 0. 结论
 
-| 问题 | 答案 |
+| 项 | v3 的决定 |
 |---|---|
-| 现在是什么 | 能演示的 UI 骨架：四页导航、页面注册表、FFmpeg 播放、UDP 发现齐了；但通信是模拟数据、资源没人回收、错误只改 label、配置全硬编码 |
-| 目标是什么 | 长期挂机不崩、断线自愈，且**只在"确认这条流有人脸识别"时才显示结果**的产品客户端 |
-| 接入主链路 | **播放 → 嗅探（循环）→ 码流匹配 → 订阅 → 推流 → 画框**。任一环节失败都**不进入下一步** |
-| 先做什么 | **P0 止血**（宫格切换内存泄漏等 5 项）。接入会把 25fps 数据流压上来，底座不稳等于放大缺陷 |
-| 核心设计难点 | 不是画框，是**"这条流是不是它"的判定**——嗅探能证明服务在，不能证明内容一致；必须靠码流列表比对（§3.4） |
-| 最大工程风险 | 异步边界画错：**任何网络/回调线程碰 `lv_*` 都会随机崩**，且难复现（§4） |
+| 自定义嗅探协议 | **删除**。端口 9100、probe/streams/match 三段握手、URL 归一化与四级匹配，全部不要 |
+| 能力判定 | `lookupService("FaceService")` → 服务在不在；`queryPublishedTopics()` → 有没有人发 `FaceResult` |
+| 订阅后没数据 | **正常态**，不显示内容即可，不报错；连接保持，生产者起来后自动开始显示 |
+| 连接/订阅失败 | 重试 5 次（1/2/4/8/16s），仍失败则**停止尝试**，UI 提示 + 留给用户手动重试 |
+| 主方案 | **A（原生客户端）**：PC 直连板端 `service_manager:9900` |
+| 保留的工程工作 | P0 止血（内存泄漏等）、最新值单槽、坐标归一化、OSD 叠加、配置/日志/重连状态机 |
 
 ---
 
-## 1. 新约束 → 对设计的影响
+## 1. 为什么不需要嗅探
 
-| 约束 | 设计影响 |
-|---|---|
-| **OmniBinder 架构注定异步**（不泵 `pollOnce` 收不到回调；回调内阻塞会卡住整个运行时） | 板端 bridge 必须拆成 **accept / poll / send 三个职责**；订阅回调只入队，不做 IO；PC 端所有 socket 操作移出 UI 线程 |
-| **嗅探接口由你实现** | 契约必须先冻结（§3）。字段不够，PC 端匹配算法就写不出来 —— 这是当前唯一的阻塞项 |
-| **循环间断连接** | 需要探测状态机 + 退避策略 + 探测幂等（重复探测不产生副作用） |
-| **订阅不成功不走后续** | 资源惰性创建：OSD 层、绘制定时器、数据面板**都在 Streaming 态才创建**；失败态不占用任何 UI 资源 |
-| **嗅探返回码流列表，需比对内容** | 需要 URL 归一化 + 四级匹配 + 唯一性兜底（§3.4）；匹配失败要给出**可读原因**，否则联调时无法定位 |
+### 1.1 三层论证
 
----
-
-## 2. 总体流程：五个状态
-
-```
-                    ┌──────────────────────────── 断开 / 切 URL / 离页
-                    ▼                                             │
-  [Idle] ──播放成功──> [Probing] ──匹配成功──> [Subscribing] ──ack──> [Streaming]
-                        │  ▲                    │                      │
-                  连不上/无服务            订阅失败                 2s 无数据
-                        │  └────退避重试───────┘                      │
-                        ▼                                              │
-                   [Unmatched] ────────── URL 变化 / 用户重试 ──────────┘
-```
-
-| 状态 | 进入条件 | UI 表现 | 退出条件 |
-|---|---|---|---|
-| **Idle** | 未播放 / 已 Stop | 只有播放控件，无任何人脸相关 UI | `do_play()` 成功 |
-| **Probing** | 播放成功，开始探测 | 状态栏灰点「正在探测识别服务」 | 匹配成功 / 连不上（保持退避）/ 返回列表但不含当前流 → Unmatched |
-| **Unmatched** | 探测通了，但**当前流不在返回列表里** | 状态栏黄点「当前流无识别结果」+ 显示已支持的码流名 | URL 变化 / 用户手动重试（降频 30s 自动重试） |
-| **Subscribing** | 匹配成功，发订阅 | 状态栏「订阅中」 | 收到 ack → Streaming；失败 → 回 Probing（退避） |
-| **Streaming** | 订阅成功 | 绿点 + 帧率/延迟；**此时才创建 OSD 层** | 断链 / 2s 无数据 / 切 URL |
-
-**关键规则**：`Streaming` 之前**不创建任何 OSD 对象、不启动绘制定时器**。这样"订阅不成功"的路径零 UI 开销，也不会留下残影。
-
----
-
-## 3. 嗅探接口契约（阻塞项，需先对齐）
-
-### 3.1 交互时序
-
-```
-PC                                         设备/bridge
- │  ① TCP connect  host:9100                  │
- │ ─────────────────────────────────────────> │
- │  ② {"type":"probe","ver":1}                │
- │ ─────────────────────────────────────────> │
- │  ③ {"type":"streams","ver":1,"idl_hash":…, │
- │      "face_on":"0","streams":[...]}        │
- │ <───────────────────────────────────────── │
- │  ④ 本地匹配（§3.4）                          │
- │  ⑤ {"type":"subscribe","stream":0}          │  ← 匹配成功才发
- │ ─────────────────────────────────────────> │
- │  ⑥ {"type":"subscribed","stream":0}         │  ← ack，之后才是 Streaming
- │ <───────────────────────────────────────── │
- │  ⑦ {"type":"face",...} 每帧一行（持续）      │
- │ <───────────────────────────────────────── │
- │  ✗ 任何时刻断开 → PC 回 Probing（指数退避）  │
-```
-
-- ①②③⑤⑥ 都是**短交互**（单次请求-响应，超时 800ms），⑦ 是持续流
-- **探测必须幂等**：同一连接重复 probe 不发副作用；探测不订阅、不改变服务端状态
-- 失败语义要明确：`connect 失败` / `无响应超时` / `返回空列表` / `列表不含当前流` 是**四种不同情况**，UI 提示也要不同（否则联调时只能瞎猜）
-
-### 3.2 最小必需字段（请在这版接口里带上）
-
-| 字段 | 必要性 | 用途 / 缺失后果 |
+| 你想知道的 | 框架已有答案 | 自定义嗅探能额外给的 |
 |---|---|---|
-| `ver` | **必需** | 协议版本，PC 端据此决定解析分支 |
-| `idl_hash` | **必需** | 与 `FaceResult::TOPIC_IDL_HASH`（`0x368f4259`）比对，不一致直接判定"不兼容"并提示，避免收到字段错位的数据 |
-| `streams[].id` | **必需** | 订阅时指定；也是匹配结果回传的键 |
-| `streams[].url` | **必需** | **匹配主键**。没有它只能靠分辨率猜，误判率极高 |
-| `streams[].name` | 建议 | UI 展示（`main` / `sub` / `通道1`），Unmatched 时列给用户看 |
-| `streams[].w` / `.h` / `.fps` | 建议 | 兜底匹配 + 与本地解码尺寸交叉验证 |
-| `streams[].codec` | 可选 | `h264`/`h265`，辅助确认（同一路不同码流可能只差这个） |
-| `face_on` | **强烈建议** | 直接告诉 PC"我现在算的是哪条"，可跳过全部启发式匹配。有它，匹配成功率接近 100% |
+| 这台设备跑没跑 face | `lookupService("FaceService")`，返回 0 = 在 | 无（只是换个端口再问一次） |
+| 现在有没有人在发结果 | `queryPublishedTopics()` 里有没有 `FaceResult`；订阅后有没有数据 | 无（订阅本身就是最权威的探针） |
+| 这条流是不是它算的 | **没有** | 一个"码流列表"，但可靠性存疑（见 §1.2） |
 
-### 3.3 URL 归一化规则（匹配前必须做）
+前两行已经说明：**嗅探的三个用途里，两个是重复的**。第三行才是嗅探的独有价值，而它的可靠性恰恰最低。
 
-| 维度 | 规则 |
-|---|---|
-| scheme | 统一小写，只接受 `rtsp`（`rtsps` 视为不同） |
-| host | 转成 IP；域名先解析；**比较时用 IP**（避免 `localhost`/主机名混用） |
-| port | 缺省补 `554`；比较时忽略默认端口的书写差异 |
-| path | 去首尾多余 `/`；保留层级（`/0` 与 `/stream1` 是不同流） |
-| query | **保留并参与比较**（`?channel=1` 常见于多通道设备） |
-| 大小写 | path 与 query **区分大小写**（RTSP 路径通常敏感） |
+### 1.2 那"码流匹配"真的不需要吗
 
-### 3.4 匹配算法：四级，逐级降级
+砍掉之后，"这条流是不是它算的那条"从**可判定**变成**隐含假设**。必须把假设写下来，否则以后出问题查不到根因：
 
-```
-① 归一化 URL 精确相等                           → 命中，置信度 高
-② host 相等 + path/query 相等（忽略端口差异）    → 命中，置信度 高
-③ face_on 指向的 stream.id == 当前流           → 命中，置信度 最高
-④ 兜底：满足以下任一
-     a) streams 只有 1 条                       → 命中，标记「推定」
-     b) host 相等 且 (w,h,fps) 与本地解码尺寸唯一吻合 → 命中，标记「推定」
-   都不满足                                     → Unmatched
-```
+> **假设 H1**：一台设备上只有一路 face_proc，且 PC 播放的是**这台设备自己**输出的流。
 
-- **「推定」要在 UI 上标出来**（如状态栏显示 `推定匹配`）。这类匹配在"同 IP 多条同分辨率码流"时可能错，标出来便于排查
-- 本地解码尺寸从 `lv_image_get_src_width/height(player)` 取，**不依赖网络信息**（见 §6）
-- 匹配失败时日志要打印：`当前 URL（归一化后）` vs `返回列表（归一化后）`，否则现场无法定位
+- 满足 H1：一切正常，框一定对得上
+- 不满足 H1（比如 Play 页填的是旁边一台 IPC 的地址，face 跑在板端）：框会画在错误的位置，**而且不会报任何错**
+
+这是砍掉嗅探的**唯一代价**。它可接受的原因：你们的部署是"板端既有 RTSP 又有 face"，天然是一对一。
+
+**零成本兜底**（三条，都不用新协议）：
+
+1. 订阅成功后调一次 `GetFrameCount()`（IDL 里已有），隔 2s 再调一次 —— **计数在涨**说明推理在跑，不是空壳服务
+2. 画面里明明有人却没有框 → 说明流不匹配，而不是"没检测到"
+3. 框的位置系统性偏移（比如整体偏上/偏左一个固定量）→ 优先怀疑坐标契约（`pad_top`），其次怀疑流不匹配
+
+### 1.3 一处推理要修正（不影响结论）
+
+你说"RTSP 流能显示，就说明框架的线程都起了"——这个**不完全成立**：`face_proc` 是可以单独死掉的（对接文档 §3.3 明确：media_proc 以 2s 无数据判定降级，就是在防这种情况）。RTSP 由 media/stream_proc 提供，和 face_proc 是独立进程。
+
+但**你的结论依然正确**，而且理由更强：face_proc 死了，客户端重试也没用——要重启的是设备，不是连接。所以"重试一段就停"是对的，只是判定条件应该是"lookupService 失败 / 订阅失败"，而不是"RTSP 能播"。
 
 ---
 
-## 4. 线程模型：三处异步边界（本项目最容易崩的地方）
-
-### 4.1 板端 bridge（受 OmniBinder 约束）
+## 2. 新流程：四态 + 一个不重试的分支
 
 ```
-main 线程        : accept + poll 多客户端（非阻塞）
-  ├─ 新连接 → 发 probe 响应（读设备侧码流表）
-  └─ 收到 subscribe → 标记该客户端为"订阅方"
-订阅线程         : for(;;) rt.pollOnce(100)      ← 必须独占，不能和 accept 混
-  └─ 回调 OnFaceResult: 只做「拷进发送队列」，禁止 send / 序列化重活 / 任何阻塞
-发送线程         : 队列 → 序列化 JSON → 逐客户端 send(MSG_NOSIGNAL)
-                  慢客户端丢弃或踢掉，绝不反压订阅线程
+点 Play
+  │
+  ├─ rt.init(板IP, 9900) → 失败 → 重试 5 次 → [Failed]（停）
+  │
+  ├─ lookupService("FaceService") → 失败 → 同上
+  │
+  ├─ subscribeTopic("FaceResult") → 失败 → 同上
+  │
+  └─ 成功 → [Subscribed] ──有数据──> [Streaming]（显示框）
+                 │
+                 └──无数据──> [NoData]（不显示，**不重试**，连接保持）
+
+Stop / 换 URL / 离开 Play 页 → 断开，回 [Idle]
 ```
 
-三条铁律（都来自框架约束，违反会死锁或丢回调）：
+| 状态 | 判定条件 | UI | 动作 |
+|---|---|---|---|
+| `Idle` | 未播放 | 无任何人脸 UI | — |
+| `Connecting` | 正在 init / lookup / subscribe | 状态栏灰点「连接识别服务…」 | 失败按 1/2/4/8/16s 重试，最多 5 次 |
+| `Failed` | 5 次都失败 | 黄点「识别服务不可用」+「重试」按钮 | **停止自动重试**，仅在重播/切 URL/点重试时重启 |
+| `Subscribed` | 订阅成功，尚无数据 | 灰点「已连接，等待数据」 | 保持长连接，不做额外动作 |
+| `NoData` | 订阅成功且超时无数据（含心跳） | 灰点「暂无人脸数据」 | **不重试**：生产者起来后数据自然到达 |
+| `Streaming` | 收到 FaceResult（含 `det_count=0` 心跳） | 绿点 + fps / 延迟 | 开始画框；2s 无数据 → 回 `NoData` 并清框 |
 
-1. 回调里只入队 —— `Re-entrant waitForReply` 死锁的经典触发点
-2. `pollOnce` 必须有人一直泵 —— 不泵就收不到任何回调
-3. 发送必须独立线程 —— 回调里 `send` 遇慢客户端会把整个运行时拖住
+关键点：
 
-### 4.2 PC 端
+1. **`NoData` 不重试**——订阅已建立，face_proc 启动后发布者自动出现，不需要重新握手。这条比"循环重连"省得多。
+2. **`det_count == 0` 也是数据**——它是心跳（对接文档 §3.3），收到就说明链路活着，状态算 `Streaming`，只是不画框。
+3. **只有 `Connecting` 才重试**，且次数封顶，避免"设备根本没有这个服务"时无限打洞。
+4. 退避：1 → 2 → 4 → 8 → 16 秒（共 31 秒），之后停。手动重试立即重置计数。
+
+---
+
+## 3. 岔路：lookupService 放在哪一侧
+
+砍掉嗅探后，这个岔路重新变成主决策。**注意 v2 推荐 B，v3 推荐 A**，翻转理由是明确的：
+
+| 维度 | A：PC 直连框架（原生客户端） | B：板端 bridge |
+|---|---|---|
+| 能力判定 | ✅ `lookupService` 原生，权威 | 需在 bridge 里再实现一遍并转述给 PC |
+| 新增协议 | ✅ 零（就是框架协议） | 要定 status / face 行格式 |
+| 新增进程 | ✅ 无 | 板端多一个进程 + 打包 |
+| 板端改动 | ❌ `face_proc` 加 `setRegisterHost(板IP)` 1 行 + 重部署 | ✅ 不动现有进程 |
+| PC 依赖 | ❌ `libomnibinder.a`（已在 Windows 编通，988K）+ C++ 包装层 | ✅ 纯 C socket |
+| IDL 耦合 | ❌ hash 必须一致；板端改 IDL 要重编 PC | ✅ JSON 松耦合 |
+| RPC（`GetStatus`/`GetFrameCount`） | ✅ 直接可用（§1.2 的兜底靠它） | 需代理 |
+
+**结论：走 A。** 三条理由：
+
+1. v2 里 B 的最大优势是"协议可裁剪、可加自定义字段"——嗅探砍掉后，**这个优势不存在了**
+2. A 的库你已经在 Windows 上编通并验证过（`build_win/target/lib/libomnibinder.a`），前提障碍消失
+3. §1.2 的兜底手段要用 `GetFrameCount()`，A 直接有，B 还得代理
+
+**A 的唯一硬阻塞**：板端能否加那 1 行 `setRegisterHost`。如果不能（固件冻结），退回 B，其余设计不变。
+
+### 3.1 工程形态：C 项目里的 C++ 边界
+
+你的 `src/` 全是 `.c`，而 `libomnibinder.a` 是 C++（STL 接口）。做法：
 
 ```
-probe 线程   : 连接 → probe → 匹配 → subscribe → ack，全部在这里；状态变化投事件
-rx 线程      : 读行 → face_proto 解析 → 写「最新值单槽」；
-               断开时置 Failed 并唤醒 probe 线程重连
-UI 线程(LVGL): 50ms 定时器只做两件事：读状态事件、比对单槽 version
+src/face/face_client.cpp     ← 唯一 C++ 文件，包装成 extern "C"
+src/face/face_client.h       ← 纯 C 头，给 ui/comm 用
 ```
 
-- **UI 线程里不允许出现任何 socket 调用**（`connect`/`recv`/`send` 一律禁止），包括"就试一下连不连得上"
-- probe 与 rx 可以是**同一个线程的两段**（先 probe 再转 rx），省一个线程；但必须能从中断中退出（`closesocket` 唤醒阻塞 `recv`）
+`CMakeLists.txt` 本来就是 `project(lvgl C CXX)`，`.cpp` 能被识别，只需：
 
-### 4.3 数据通路：FaceResult 不进队列
+```cmake
+file(GLOB FACE_SOURCES "${PROJECT_SOURCE_DIR}/src/face/*.cpp")
+list(APPEND MAIN_SOURCES ${FACE_SOURCES})
+target_include_directories(lvgl PUBLIC F:/git-clone/OmniBinder/include)
+target_link_libraries(main ${MAIN_LIBS} F:/git-clone/OmniBinder/build_win/target/lib/libomnibinder.a)
+# Windows 还要 ws2_32（本项目已链）；Linux 改 -ldl -lpthread
+```
 
-不需要和画面同步 ⇒ 排队列是错的。25fps 数据在 50ms 轮询周期里必然堆积，队列（64 槽）满了还会丢新帧。
+`face_client.h` 对外只暴露 5 个函数：
 
 ```c
-/* rx 线程：覆盖式写入 */
-face_store_put(const face_result_t *r);        /* 加锁覆写 + version++ */
+bool face_start(const char *board_ip, int port);          /* 起线程：init + lookup + subscribe */
+void face_stop(void);
+bool face_get_latest(face_result_t *out, uint32_t *ver);  /* 单槽读取 */
+int  face_get_state(void);                                /* Idle/Connecting/…/Streaming */
+const char *face_state_str(int st);                       /* 状态栏文案 */
+```
+
+UI 层只 include 这个 `.h`，**完全看不到 C++**。
+
+---
+
+## 4. 线程模型（A 方案，必须严格遵守）
+
+框架文档给出两条硬约束（`api-reference.md:148`、`:160`）：
+
+- `lookupService()` / `subscribeTopic()` / `invoke()` 是**同步阻塞** API，**"不建议在 owner event-loop 回调中再发起"**
+- `run()` / `pollOnce()` **同一实例不允许两个线程并发驱动**
+
+所以：
+
+```
+[C++ 驱动线程]  rt.run()  或  for(;;) rt.pollOnce(100)      ← 只这一个线程驱动 event-loop
+                  └─ TopicCallback（在此线程执行）
+                       └─ 只做：写最新值单槽 + version++     ← 禁止阻塞 / IO / 同步 API
+
+[C++ 控制线程]  init → lookupService → subscribeTopic
+                  ↑ 必须与驱动线程分开：同步 API 要 event-loop 在跑才能返回
+                  ↑ 且在回调里绝对不能调它们（自锁）
+
+[UI 线程 LVGL]  50ms 定时器：face_get_state() + face_get_latest()
+                  ← 禁止任何网络 / 同步 API 调用
+```
+
+顺序必须是：**先起驱动线程 `run()`，再由控制线程调 `lookupService`**。反过来（先同步 lookup）会因为没人泵 event-loop 而超时。
+
+停止：`rt.stop()` 可从任意线程调用（文档明确），用它中断阻塞等待，再由 `face_stop()` join 线程。
+
+---
+
+## 5. 数据通路：最新值单槽
+
+不需要和画面同步 ⇒ 不排队列。25fps 在 50ms 轮询里必然堆积，队列（64 槽）满了还会丢新帧。
+
+```c
+/* 回调线程：覆盖式写入 */
+face_store_put(const face_result_t *r);          /* 加锁覆写 + version++ */
 /* UI 线程：只在 version 变化时取一次 */
 bool face_store_get_if_new(face_result_t *out, uint32_t *last_ver);
 ```
 
-状态类事件（Connected/Subscribed/Failed/Timeout）仍走原事件队列 —— 它们不能丢。
+状态变化（`Connecting/Subscribed/NoData/Streaming/Failed`）走**事件队列**，因为它们不能丢。
 
 ---
 
-## 5. PC 端模块划分
+## 6. 坐标换算：不需要编码分辨率
 
-| 模块 | 职责 | 备注 |
-|---|---|---|
-| `src/comm/comm_face.c` | 连接管理 + 探测状态机 + 订阅 + rx | 所有 socket 都在这里；对外只暴露状态与单槽 |
-| `src/comm/face_proto.c` | 行 → 结构体（probe 响应 / face 帧） | 纯函数，可单测 |
-| `src/core/json.c` | JSON 解析 | 建议 vendor cJSON（2 文件、MIT）；也可定长 `sscanf` |
-| `src/comm/face_store.c` | 最新值单槽 | 20 行，加锁即可 |
-| `src/ui/ui_face_osd.c` | 框 + 姓名的创建/更新/清除 | **只在 Streaming 态创建** |
-| `comm.c` / `ui.c` | 挂状态事件；Play 页接 `do_play/stop` 钩子 | 改动很小 |
-
----
-
-## 6. 坐标换算：PC 端不需要编码分辨率
-
-板端要 `enc_w/enc_h`，因为框画在**编码帧**上（`osd_face.cpp:63`，1920×1080 时 ×3）。PC 端画在**控件**上，两步缩放互相抵消：
+板端要 `enc_w/enc_h`，因为框画在**编码帧**上（`osd_face.cpp:63`，1920×1080 时 ×3）。PC 画在**控件**上，两步缩放会抵消：
 
 ```
-px_enc  = x * (enc_w/640)          ← 板端
-px_disp = px_enc * (W/enc_w)       ← 再缩到控件
-        = x * W/640                ← enc_w 约掉
+px_enc  = x * (enc_w/640)      px_disp = px_enc * (W/enc_w)  ⇒  px_disp = x * W/640
 ```
 
 所以：
@@ -206,15 +206,14 @@ px_disp = px_enc * (W/enc_w)       ← 再缩到控件
 ```
 u  = clamp(x_canvas / 640.0, 0, 1)
 v  = clamp((y_canvas - 140.0) / 360.0, 0, 1)
-px = X0 + u * W_disp
-py = Y0 + v * H_disp
+px = X0 + u * W_disp ,  py = Y0 + v * H_disp
 ```
 
 - `640 / 360 / 140` 是画布常量（`frame_types.h`、`osd_face.cpp:50`），编译期写死
 - `X0/Y0/W_disp/H_disp` = 视频在控件内的显示矩形：`lv_image_get_src_width/height(player)` + `LV_IMAGE_ALIGN_CONTAIN` 算黑边 + 与控件区域求交，**纯本地**
-- 前提：画布活动区 640×360 与视频同为 16:9（板端按 16:9 写死）；非 16:9 的流按 §3.4 也匹配不上
-- 与板端一致：换算后 `< 4px` 的框丢弃（`osd_face.cpp:75`），否则小框变噪点
-- **过期清除**：2s 无新帧或链路断开 → 立即隐藏全部框，否则留鬼影
+- 前提：画布活动区 640×360 与视频同为 16:9（板端 `g_enc_w=1920, g_enc_h=1080` 按 16:9 写死）
+- 与板端一致：换算后 `< 4px` 丢弃（`osd_face.cpp:75`）
+- **过期清除**：`NoData` 或断开 → 立即隐藏全部框，否则留鬼影
 
 ---
 
@@ -224,7 +223,7 @@ py = Y0 + v * H_disp
 
 | # | 事项 | 文件 |
 |---|---|---|
-| 1 | 宫格切换内存泄漏：`player_widgets_t` / `player_data_t` / `lv_strdup(url)` 全不释放 | `ui_page_play_multplayer.c:547/566/573`，用 `LV_EVENT_DELETE` 统一 `lv_free` |
+| 1 | 宫格切换内存泄漏：`player_widgets_t` / `player_data_t` / `lv_strdup(url)` 都不释放 | `ui_page_play_multplayer.c:547/566/573`，用 `LV_EVENT_DELETE` 统一 `lv_free` |
 | 2 | 手势翻页 `/` → `%` | `ui.c:150,154` |
 | 3 | 删死代码 `ui_page_multplayer_create()`（~110 行）+ 死声明 | `ui_page_play_multplayer.c:802`、`.h` |
 | 4 | `video_Null.png` 绝对路径 → 相对路径；`creat_single_palyer` 加 `static` 并改名 | 同上 `:416,499,476` |
@@ -232,11 +231,11 @@ py = Y0 + v * H_disp
 
 ### P1 · 加固（3~5 天）
 
-配置模块（`config.json`：RTSP 默认地址、`face_host`/`face_port`、日志级别）、日志分级 + 文件轮转、播放并发上限（9 宫格软解会打满 CPU）、布局参数集中到 `ui_app.h`、退出时真正 `app_pages_destroy()` + `comm_deinit()`。
+配置模块（板 IP/端口、默认 RTSP、日志级别 → `config.json`）、日志分级 + 文件轮转、9 宫格软解并发上限、布局参数集中到 `ui_app.h`、退出时真正 `app_pages_destroy()` + `comm_deinit()`。
 
-### P2 · 工程化（持续）
+### P2 · 工程化
 
-CMake 拆 `app_core` + `main`；单测覆盖 **URL 归一化 + 匹配算法 + 坐标换算 + JSON 解析**（全是纯函数，最值得测）；告警清零。
+CMake 拆 `app_core` + `main`；单测覆盖 **坐标换算 / 解析 / 状态机迁移**；告警清零。
 
 ---
 
@@ -244,38 +243,38 @@ CMake 拆 `app_core` + `main`；单测覆盖 **URL 归一化 + 匹配算法 + �
 
 | 里程碑 | 内容 | 验收 |
 |---|---|---|
-| **M0**（1~2 天） | P0 止血 | 切宫格 50 次 RSS 不涨；`ninja` 无新增告警 |
-| **M1**（2~3 天） | 嗅探握手（**无 UI**）：探测 → 打印返回的码流列表 → 匹配 → 打印结论 | 控制台能正确显示「匹配到 stream 0」/「列表无当前流」/「连不上」三种结果 |
-| **M2**（3~5 天） | 订阅 + 单槽 + Face 页表格（seq/det/cos/fps） | 表格里 seq 持续递增；断网 10s 内自动恢复 |
-| **M3**（3~5 天） | OSD 叠加 | 1080p/360p 两种源下框贴合画面，误差 < 2px；快速挥手时框"拖后"不超过 1 帧 |
-| **M4**（1 周） | 产品化 | 8 小时挂机通过；四种失败态都有可读提示 |
+| **M0**（1~2 天） | P0 止血 | 切宫格 50 次 RSS 不涨；构建无新增告警 |
+| **M1**（2~3 天） | **C++ 控制台探针**：init → lookup → subscribe → 打印 seq/det/name/perf | 控制台能看到 seq 持续递增；拔网线能看到超时；`det_count=0` 心跳可见 |
+| **M2**（3~5 天） | 接进 App：`face_client.cpp` + 单槽 + Play 页表格 | App 里能看到真实 seq；`NoData` / `Failed` 两态可辨 |
+| **M3**（3~5 天） | OSD 叠加 | 1080p/360p 两种源下框贴合 < 2px；快速挥手滞后不超过 1 帧 |
+| **M4**（1 周） | 产品化 | 8 小时挂机通过；各状态提示正确；断链能自愈 |
 
-**顺序不可颠倒**：M1 只做"打印"，把匹配逻辑先验证对。因为匹配错的表现和坐标错、解析错非常像，混在一起会排查到崩溃。
+M1 的探针不是临时脚本，**它就是 A 方案的最小可运行客户端**，后面的 `face_client.cpp` 直接从它长出来。
 
 ---
 
-## 9. 待你确认（M1 的前置）
+## 9. 待你确认
 
-| # | 事项 | 说明 |
+| # | 事项 | 影响 |
 |---|---|---|
-| 1 | **嗅探接口的报文与字段** | 按 §3.2 最小字段清单对齐；尤其是 `streams[].url` 和 `face_on` 有没有 |
-| 2 | `url` 的形态 | 是完整 RTSP URL，还是 `ip:port/path`，还是只有 `channel id`？决定归一化实现 |
-| 3 | 探测是否与订阅**同连接** | 同连接可省一次握手；不同连接则 PC 端要断开重连 |
-| 4 | 循环间隔由谁定 | 建议 PC 侧控制（1s→2s→4s→…→10s，上限 30s），设备侧无状态 |
-| 5 | 多路设备 | 一台设备多条流时，`face_on` 是否只标一条？还是可能多条都有 face_proc |
-| 6 | 端口 | 9100 是否定稿；多台设备同网段时是否需要可配 |
+| 1 | **板端能否加 `setRegisterHost(板IP)`** | A 的硬前提。不行就得退回 B（bridge），其余设计不变 |
+| 2 | 板 IP / SM 端口 | 定 `config.json` 默认值 |
+| 3 | 重试次数与间隔是否按 1/2/4/8/16s × 5 次 | 影响"多久放弃" |
+| 4 | `Failed` 后是否只在用户操作时重试 | 建议是；否则退化成无限重连 |
+| 5 | 是否需要 `GetFrameCount()` 兜底（§1.2） | 建议要，一次调用即可排除"空壳服务" |
+| 6 | 多路设备是否真的不存在 | H1 假设；若存在多路，需要重新引入某种通道标识 |
 
 ---
 
 ## 10. 不要做的事
 
-1. **不要在 UI 线程做任何 socket 操作**——包括"只 connect 一下试试"
-2. **不要在订阅回调里 send / 序列化 / 写盘**——OmniBinder 会死锁或丢回调
-3. **不要先做 OSD**：先让匹配和数字对，再让框对
-4. **不要用 `lv_canvas` 逐帧画框**：几个矩形用 `lv_obj` 叠加，CPU 差一个数量级
-5. **不要把 FaceResult 排队列**：不同步场景下正确结构是"最新值单槽"
-6. **不要在匹配失败时静默**：必须区分"连不上 / 无响应 / 空列表 / 列表不含当前流"
-7. **不要为方案 A 迁平台**：它现在能编，但独有优势（RPC）用不上，且要动生产进程 `face_proc`
+1. **不要在 UI 线程调任何同步 API**（`lookupService`/`subscribeTopic`/`invoke`）——会冻住画面
+2. **不要在 `TopicCallback` 里发起同步 API**——文档明确"不建议"，会自锁
+3. **不要两个线程同时驱动 `run()`/`pollOnce()`**——同一实例禁止并发驱动
+4. **不要在 `NoData` 时重连**——订阅还在，生产者起来自然就有数据
+5. **不要把 FaceResult 排队列**——不同步场景下正确结构是"最新值单槽"
+6. **不要先做 OSD**——先让状态机和数字对，再让框对
+7. **不要用 `lv_canvas` 逐帧画框**——几个矩形用 `lv_obj` 叠加，CPU 差一个数量级
 
 ---
 
@@ -284,9 +283,10 @@ CMake 拆 `app_core` + `main`；单测覆盖 **URL 归一化 + 匹配算法 + �
 | 内容 | 位置 |
 |---|---|
 | 对接文档 | `F:\git-clone\media-refactor-arch\docs\PC客户端订阅FaceResult-对接文档-20261103.md` |
-| IDL 契约 | `F:\git-clone\OmniBinder\3516-media-refactor\idl\face_service.bidl` |
+| 框架 API（`lookupService` / 阻塞语义） | `F:\git-clone\OmniBinder\docs\api-reference.md:148,276` |
+| 线程模型 | `F:\git-clone\OmniBinder\docs\threading-model.md` |
+| IDL 契约 | `...\3516-media-refactor\idl\face_service.bidl` |
 | 板端坐标换算参考 | `...\src\media_core\osd_face.cpp:59-85` |
 | 画布常量 | `...\src\frame_pool\frame_types.h` |
-| 订阅实现参考 | `...\src\media_core\osd_face.cpp`（`OnFaceResult`） |
-| 框架 API / 线程模型 | `F:\git-clone\OmniBinder\docs\api-reference.md`、`threading-model.md` |
+| Windows 版框架库 | `F:\git-clone\OmniBinder\build_win\target\lib\libomnibinder.a`（988K） |
 | 本项目架构梳理 | `docs/project_map.md` |
