@@ -171,7 +171,9 @@ CMake 使用 `file(GLOB)` 收集 `src/ui/*.c`，新增源文件后重新 configu
 
 | 文档 | 内容 |
 |---|---|
+| [docs/roadmap.md](docs/roadmap.md) | **改造路线**：稳定性分层（P0~P2）+ FaceResult 接入方案（订阅状态机、订阅源抽象、OSD 规范、里程碑） |
 | [docs/project_map.md](docs/project_map.md) | 项目整体梳理：启动链路、页面注册表机制、通信层、技术债清单 |
+| [docs/setRegisterHost.md](docs/setRegisterHost.md) | 跨机订阅前置改动：`setRegisterHost` 的原理、插入位置、验证与排错 |
 | [docs/ffmpeg_player_guide.md](docs/ffmpeg_player_guide.md) | `lv_ffmpeg_player` 使用指南与配置要点 |
 | [docs/multplay_page_freeze_debug.md](docs/multplay_page_freeze_debug.md) | 多路页切换卡死（canvas 0×0）根因与修复 |
 | [docs/textarea_jumping_debug.md](docs/textarea_jumping_debug.md) | RTSP 输入框文字跳动问题的完整排查过程 |
