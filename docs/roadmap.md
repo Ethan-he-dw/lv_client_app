@@ -86,7 +86,7 @@
   │
   ├─ lookupService("FaceService") → 失败 → 同上
   │
-  ├─ subscribeTopic("FaceResult") → 失败 → 同上
+  ├─ proxy.SubscribeFaceResult(cb)（生成代码；底层即 subscribeTopic）→ 失败 → 同上
   │
   └─ 成功 → [Subscribed] ──有数据──> [Streaming]（显示框）
                  │
@@ -256,7 +256,8 @@ do_play("rtsp://192.168.10.168:554/0")
                   └─ TopicCallback（在此线程执行）
                        └─ 只做：写最新值单槽 + version++     ← 禁止阻塞 / IO / 同步 API
 
-[C++ 控制线程]  init → lookupService → subscribeTopic
+[C++ 控制线程]  init → lookupService → proxy.SubscribeFaceResult(cb)
+                  ↑ 用生成代码的订阅 API，不要手写 topic 名（带类型检查 + IDL hash 校验）
                   ↑ 必须与驱动线程分开：同步 API 要 event-loop 在跑才能返回
                   ↑ 且在回调里绝对不能调它们（自锁）
 
@@ -513,6 +514,7 @@ M4 之前先跑一次 C++ 控制台探针（init → lookup → subscribe → �
 ## 10. 不要做的事
 
 1. **不要在 UI 线程调任何同步 API**（`lookupService`/`subscribeTopic`/`invoke`）——会冻住画面
+2. **不要手写 `subscribeTopic("FaceResult")`**——用生成的 `proxy.SubscribeFaceResult(cb)`，否则丢掉类型检查与 IDL hash 校验
 2. **不要在 `TopicCallback` 里发起同步 API**——文档明确"不建议"，会自锁
 3. **不要两个线程同时驱动 `run()`/`pollOnce()`**——同一实例禁止并发驱动
 4. **不要在 `NoData` 时重连**——订阅还在，生产者起来自然就有数据
