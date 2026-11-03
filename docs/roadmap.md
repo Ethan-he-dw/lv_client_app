@@ -310,12 +310,12 @@ bool face_store_get_if_new(face_result_t *out, uint32_t *last_ver);
 
 ```
 [00] seq=12841 det=2  st=STREAMING      fps=24.8
-[01] best: 张三  matched  cos=0.732  thr=0.55
+[01] best: P001  matched  cos=0.732  thr=0.55
 [02] det=18.2ms mbf=6.1ms dec=4.3ms     score_thr=0.50
 [03] ts=+0.041s  rx=12841  drop=0
 [04] #0 s=0.98 (210,320)-(360,500)
 [05] #1 s=0.91 (410,330)-(520,470)
-[06] alt: 李四 0.71 | 王五 0.68
+[06] alt: P007 0.71 | P012 0.68
 ```
 
 - 坐标为**画布坐标**（640×640，含 `pad_top=140`），不做换算——换算后的显示坐标只在 OSD 内部用，面板保持"原始值"便于和板端 `/tmp/media.log` 对照
