@@ -17,7 +17,7 @@
 > ⑤ 重试耗尽后**仅用户操作时重试**（已确认）；
 > ⑥ `GetFrameCount()` 的用途说明（§1.2）；
 > ⑦ 多路设备**确认不存在** → H1 从"假设"升级为"前提"；
-> ⑧ **字体纠正**：`montserrat` 无中文字形，姓名必须用 `lv_font_source_han_sans_sc_16_cjk`（§5.5）。
+> ⑧ **字体结论（已定）**：后期不会出现中文姓名，识别结果用**字母或编号**（如 `P001`），因此统一用 `montserrat_12`，不引入 CJK 字体、不处理生僻字；中文支持仅作备选记录（§5.5）。
 
 ---
 
@@ -207,7 +207,7 @@ const face_source_ops_t *face_source_active(void);      /* **单例**（已定�
 
 | 实现 | 用途 | 要点 |
 |---|---|---|
-| `face_src_mock.c` | **无板开发 / UI 联调 / 单测** | 内部定时器造数据：`det_count=0` 心跳、1~3 个随机框、缓慢移动的假人、**每框 5 组合法 kps**（OSD 要画点）、中文姓名"张三"。PC 上就能把面板与 OSD 调到满意 |
+| `face_src_mock.c` | **无板开发 / UI 联调 / 单测** | 内部定时器造数据：`det_count=0` 心跳、1~3 个随机框、缓慢移动的假人、**每框 5 组合法 kps**（OSD 要画点）、姓名字母编号（如 `P001`）。PC 上就能把面板与 OSD 调到满意 |
 | `face_src_omnibinder.cpp` | 真机（A） | init → lookup → subscribe；独立线程 `run()` 泵事件循环；回调只写单槽 |
 | `face_src_tcp.c` | 备用（B） | 连 bridge，按行解析；纯 C |
 
@@ -237,7 +237,8 @@ do_play("rtsp://192.168.10.168:554/0")
 - 换 URL → 先 `close()` 再 `open()`（单例语义，§3.2）
 - 这只解决"**连哪台设备**"，不解决"**是不是这条流**"（后者见 §1.2 H1 前提）
 
-> **开发期注意**：现在 Play 页默认地址是 `rtsp://192.168.10.248:555/stream1`（一台 IPC），按此规则会去连 `192.168.10.248:9900`，而 face 在 `.168` → 会走满 10 次重试后 `Failed`。所以开发期要么把默认地址改成板端流，要么填 `face_host=192.168.10.168` 覆盖。
+> **默认地址已改（2026-11-03）**：Play 页默认从 `rtsp://192.168.10.248:555/stream1` 改为 **`rtsp://192.168.10.168:554/live0`**（板端 `stream_proc` 的 RTSP 路由为 `/live0`~`/live3`，`live0`=主码流、`live2`=子码流）。这样"板 IP = 流 IP"的前提在开箱状态下成立，`face_host` 无需配置。
+> **遗留**：multPlay 页各格默认仍是 `rtsp://192.168.10.206/0`（测试用 IPC），暂未改；它不参与 FaceResult 链路，不影响本方案。
 
 ---
 
@@ -319,7 +320,7 @@ bool face_store_get_if_new(face_result_t *out, uint32_t *last_ver);
 
 - 坐标为**画布坐标**（640×640，含 `pad_top=140`），不做换算——换算后的显示坐标只在 OSD 内部用，面板保持"原始值"便于和板端 `/tmp/media.log` 对照
 - 超过 4 个框时只列前 4 个，末行 `... +N more`（面板用于定位问题，不是逐帧观看）
-- **面板含中文（姓名/备选）→ 必须用 CJK 字体**，见 §5.5
+- **文本为英文/数字/编号 → `montserrat_12` 即可**；若将来姓名出现中文，按 §5.5 切 CJK 字体
 
 **性能红线：面板刷新必须节流。** 25fps 全量 `lv_label_set_text()` 重设多行文本，会持续触发文本重排 + 整块重绘，LVGL 单线程会被吃掉。做法：
 
@@ -337,7 +338,7 @@ bool face_store_get_if_new(face_result_t *out, uint32_t *last_ver);
 | | 线宽 | **2 px** |
 | | 填充 / 圆角 | 无填充 / 直角（`radius=0`） |
 | **best 框** | 颜色 | **黄色** `0xFACC15`（覆盖绿色，优先最高） |
-| 姓名标签 | 字号 | **`lv_font_source_han_sans_sc_16_cjk`**（16px CJK 位图字体，已启用；`montserrat` 无中文字形，见 §5.5） |
+| 姓名标签 | 字号 | **`lv_font_montserrat_12`**（姓名用字母/编号，拉丁字形足够；若将来出现中文，按 §5.5 切 CJK 字体） |
 | | 文字色 / 底色 | 白色 / **黑色 `LV_OPA_60`** 半透明 |
 | | 内边距 | 水平 4px、垂直 2px；圆角 2px |
 | | 位置 | best 框上沿外侧 4px；上方空间不足时放到框内顶部 |
@@ -354,7 +355,7 @@ bool face_store_get_if_new(face_result_t *out, uint32_t *last_ver);
 #define OSD_BOX_COLOR        lv_color_hex(0x22C55E)                    /* 绿：普通框 */
 #define OSD_BOX_COLOR_BEST   lv_color_hex(0xFACC15)                    /* 黄：best 框 */
 #define OSD_BOX_WIDTH        2
-#define OSD_NAME_FONT        &lv_font_source_han_sans_sc_16_cjk       /* CJK 16px */
+#define OSD_NAME_FONT        &lv_font_montserrat_12                    /* 拉丁/编号 */
 #define OSD_NAME_BG_OPA      LV_OPA_60
 #define OSD_NAME_PAD_X       4
 #define OSD_NAME_PAD_Y       2
@@ -369,7 +370,7 @@ bool face_store_get_if_new(face_result_t *out, uint32_t *last_ver);
 ```
 ┌──────────────────────────────────────────┐
 │                                          │
-│      ┌ 张三 ┐                            │
+│      ┌ P001 ┐                            │
 │   ┏━━┷━━━━━━┓        ┌────────┐          │
 │   ┃ (黄,best)┃        │  绿     │          │
 │   ┗━━━━━━━━━┛        └────────┘          │
@@ -402,16 +403,20 @@ Play 页现有三个按钮（Play / Stop / Data）。调整为四个：
 1. 现 `data_btn_cb()` 里有 `if(s_fullscreen) return;` —— OSD 按钮**不能**照抄这个判断，否则全屏就看不了框
 2. 面板与 OSD 互不影响：关面板不隐藏框，关 OSD 不影响面板数字
 
-### 5.5 字体：中文姓名必须用 CJK 字体（容易踩的坑）
+### 5.5 字体策略：姓名用字母/编号（已定）
 
-- `lv_conf.h:746` 默认字体是 `montserrat_14`，而 **Montserrat 不含任何中文字形**
-- 好消息：`LV_FONT_SOURCE_HAN_SANS_SC_16_CJK = 1`（`lv_conf.h:728`）已启用，内置 **16px CJK 位图字体**，覆盖 1338 个常用字
-- 所以：**OSD 姓名、面板里的姓名与备选，都必须显式指定 `&lv_font_source_han_sans_sc_16_cjk`**，否则中文会渲染成空白/方块
-- 数字与英文（`seq`/`fps`/坐标）仍可用 `montserrat_12`；混排时行高取较大者，注意面板行距
-- **生僻字风险**：1338 常用字之外的姓名会缺字。真碰到时长两条路：
-  1. 启用 `LV_USE_FREETYPE 1`（当前为 `0`，`lv_conf.h:1086`），运行时加载 `lvgl/scripts/built_in_font/SourceHanSansSC-Normal.otf`（需评估 16MB `LV_MEM_SIZE` 是否够）
-  2. 用 LVGL 字体工具把实际用到的字预生成位图字体（体积小，但要用到哪些字才能预生成）
-- **验收时专门造一个中文姓名**（mock 默认就叫"张三"）确认不是方块——这一条不写进验收，上线才发现就晚了
+- 已确认：**后期不会出现中文姓名**，识别结果用**字母或编号**显示（如 `P001`、`zhangsan`）
+- 因此姓名与面板文本统一用 **`lv_font_montserrat_12`**，不引入 CJK 字体，也**不需要支持生僻字**
+- 面板里的其余内容（`seq`/`fps`/坐标/状态）本来就是拉丁字符，同字体即可，行高一致
+
+**若将来确实要中文**（仅记录备选方案，当前不实施）：
+
+| 方案 | 做法 | 代价 |
+|---|---|---|
+| 内置 CJK 位图字体 | `lv_conf.h:728` 的 `LV_FONT_SOURCE_HAN_SANS_SC_16_CJK` 已是 `1`，把 `OSD_NAME_FONT` 改指向它即可 | 16px 比 12px 大；只覆盖 1338 常用字，生僻字缺字 |
+| Freetype 运行时加载 | 启用 `LV_USE_FREETYPE 1`（当前 `0`） + `lvgl/scripts/built_in_font/SourceHanSansSC-Normal.otf` | 需评估 16MB `LV_MEM_SIZE`；启动变慢 |
+
+> 这一节保留的原因：字体是上线后才暴露的问题。真出现中文需求时，改的是**一个宏**（方案一），不需要动布局。
 
 ---
 
@@ -453,7 +458,7 @@ px = X0 + u * W_disp ,  py = Y0 + v * H_disp
 
 ### P1 · 加固（3~5 天）
 
-配置模块（板 IP/端口、默认 RTSP、日志级别 → `config.json`）、日志分级 + 文件轮转、9 宫格软解并发上限、布局参数集中到 `ui_app.h`、退出时真正 `app_pages_destroy()` + `comm_deinit()`。
+配置模块（`face_host` 覆盖、日志级别；**板 IP 已由 URL 推导、默认 RTSP 已指向板端，不再需要配置**）、日志分级 + 文件轮转、9 宫格软解并发上限、布局参数集中到 `ui_app.h`、退出时真正 `app_pages_destroy()` + `comm_deinit()`。
 
 ### P2 · 工程化
 
@@ -467,7 +472,7 @@ CMake 拆 `app_core` + `main`；单测覆盖 **坐标换算 / 解析 / 状态机
 |---|---|---|
 | **M0**（1~2 天） | P0 止血 | 切宫格 50 次 RSS 不涨；构建无新增告警 |
 | **M1**（1~2 天） | **抽象层 + mock 实现**：`face_source.h` + `face_src_mock.c`（造心跳/框/移动假人） | 无板情况下 `latest()` 能持续返回新 version；状态机可手动驱动到各态 |
-| **M2**（3~5 天） | **BACKEND DATA 面板**接真实字段（先用 mock 数据） | 面板按 4~5Hz 刷新；格式与 §5.2 一致；中文姓名不是方块（§5.5）；25fps 下 CPU 无明显上升 |
+| **M2**（3~5 天） | **BACKEND DATA 面板**接真实字段（先用 mock 数据） | 面板按 4~5Hz 刷新；格式与 §5.2 一致；姓名（字母/编号）正常显示；25fps 下 CPU 无明显上升 |
 | **M3**（3~5 天） | **OSD 叠加 + 按钮**：对象池 + 坐标换算 + kps 点 + OSD 开关（含全屏） | 绿框 2px、best 黄框、姓名（未命中显示 `unknown`）、5 个蓝色关键点都正确；mock 假人移动时框与点跟得住；真实源下 1080p/360p 贴合 < 2px；全屏仍可开关 |
 | **M4**（2~3 天） | 接真机：`face_src_omnibinder.cpp`（或 tcp）替换 mock | 不动 UI 代码，只改一个实现 + 一处配置即上线 |
 | **M5**（1 周） | 产品化 | 8 小时挂机通过；各状态提示正确；断链能自愈 |
@@ -489,18 +494,19 @@ M4 之前先跑一次 C++ 控制台探针（init → lookup → subscribe → �
 | 3 | 重试耗尽 | 进 `Failed`，**仅用户操作**（重播/切 URL/点重试）才重启 |
 | 4 | kps | **只上 OSD**（5 个蓝点），面板不显示 |
 | 5 | 姓名标签 | `matched` 与否都显示；未命中显示 `unknown` |
-| 6 | OSD 视觉 | 绿框 `0x22C55E` 2px / best 黄 `0xFACC15` / 姓名 CJK 16px + 黑底 60% / kps 点蓝 4px |
+| 6 | OSD 视觉 | 绿框 `0x22C55E` 2px / best 黄 `0xFACC15` / 姓名 `montserrat_12` + 黑底 60% / kps 点蓝 4px |
 | 7 | OSD 默认 | **开**（全屏仍可用） |
 | 8 | 数据源 | `face_source` **单例**，不支持多设备并行 |
 | 9 | 多路设备 | **确认不存在** → H1 成立，不需要通道号 |
 | 10 | `GetFrameCount()` | 仅作**诊断**（排除空壳服务、交叉验证帧率），不进主流程 |
+| 11 | Play 默认地址 | 已改为 `rtsp://192.168.10.168:554/live0`（`ui_page_play.c:190`），开箱即满足"板 IP = 流 IP" |
+| 12 | 姓名显示 | **字母或编号**（如 `P001`），后期不会出现中文；不引入 CJK 字体、不支持生僻字 |
 
-### 仍需确认（2 项）
+### 仍需确认（1 项）
 
 | # | 事项 | 说明 |
 |---|---|---|
-| A | **板端实施 `setRegisterHost` 的时间点** | 方案 A 的硬前提，落地步骤见 `docs/setRegisterHost.md`。不实施的唯一退路是退回 bridge（B），其余设计不变 |
-| B | 中文生僻字是否需要支持 | 内置 CJK 字体只覆盖 1338 常用字。若人名超纲，需启用 Freetype 或预生成字体（§5.5），成本差一个量级 |
+| A | **板端实施 `setRegisterHost` 的时间点** | 方案 A 的硬前提（**唯一阻塞项**），落地步骤见 `docs/setRegisterHost.md`。不实施的退路是退回 bridge（B），其余设计不变 |
 
 ---
 
