@@ -12,8 +12,8 @@
 | 现在是什么 | **一个能演示的 UI 骨架**。四页导航、页面注册表、FFmpeg 播放、UDP 设备发现齐了，但：通信数据是模拟的、资源生命周期没人管、错误只是改个 label、配置全硬编码 |
 | 目标是什么 | **一个能长期挂着跑的产品客户端**：断线自愈、不崩不漏、能消费板端真实 FaceResult 并叠加到视频上 |
 | 两件事的先后 | **必须先稳定底座，再接数据**。理由：FaceResult 是持续高频数据流（板端 15~25fps），会放大现有的每一个资源/线程缺陷——底座不稳，接完只会从"偶发卡顿"变成"必崩" |
-| 关键决策 | 走 **bridge（TCP + JSON Lines）**，不走原生 OmniBinder 客户端（你的 PC 是 Windows，方案 A 无库可用） |
-| 最大隐藏坑 | **FaceResult 没有通道号字段**，多路播放时无法区分是哪一路的结果；bridge 必须自己补 `channel` 与 `enc_w/enc_h`，否则 OSD 一定画错 |
+| 关键决策 | 主线走 **bridge（TCP + JSON Lines）**。文档已修正：**方案 A 在 Windows/MSYS2 也实测可编**（本机 `libomnibinder.a` 988K、`omni-idlc.exe` 637K 已核实），但走 A 要付三项代价：双 topic 订阅、改 IDL 加通道号、侵入 face_proc。所以 A 降级为**联调探针**，不做产品主路径 |
+| 最大隐藏坑 | **FaceResult 和 FrameReady 都没有通道号**，多路时无法区分哪一路；而且**编码分辨率不在 FaceResult 里**（在 `FrameReady.width/height`）。bridge 必须合并两个 topic 并补 `channel` + `enc_w/enc_h`，否则 OSD 一定画错 |
 
 ---
 
@@ -128,16 +128,24 @@
 
 ## 4. 主线二：接入 FaceResult
 
-### 4.1 为什么只能走 bridge
+### 4.1 选型：A 已可行，但主路径仍应走 bridge
 
-| 维度 | 方案 A（原生客户端） | 方案 B（bridge） | 你的情况 |
+文档已修正为「Windows/Linux 均已实测可编」，前提不再成立。**但「能编」不等于「该用」**，逐项比过之后结论没变，理由换成了下面三条硬约束：
+
+| 维度 | 方案 A（原生客户端） | 方案 B（bridge） | 对本项目的影响 |
 |---|---|---|---|
-| PC 依赖 | `libomnibinder.a`（**Linux x86 静态库**）+ `omni-idlc` 生成代码 | 无，普通 socket | ❌ A 在 Windows/MinGW 下无库可用，框架 Windows 支持"未实测" |
-| 板端改动 | `face_proc` 加 `setRegisterHost(板IP)` 1 行 | 新增 bridge 进程 | B 的改动局限在新文件，风险更低 |
-| 协议耦合 | 强绑 IDL hash（改 IDL 两端要同步重建） | JSON，可裁剪 | B 更适合迭代 |
-| 双向控制 | 原生支持 RPC | 需 bridge 代理 | 现在没有控制需求，先不管 |
+| 平台可行性 | ✅ Windows/MSYS2 与 Linux x86 均可编 | ✅ 任意 | 打平（A 的前提障碍已消除） |
+| **通道标识** | ❌ IDL 里没有 `channel`；要加就得改 `.bidl` → `TOPIC_IDL_HASH` 变化 → **板端 media_proc/osd_face 必须同步重建** | ✅ JSON 里加一个字段零成本 | **A 对多路宫格是硬伤**，B 无痛 |
+| **编码分辨率** | ❌ 不在 FaceResult 里，必须**额外订阅 `FrameReady`** 取 `width/height`，再按 `seq` 对齐两路 topic | ✅ bridge 同时订阅两个 topic，合并成一行 JSON 下发 | A 的客户端要维护两路流的时间对齐，复杂度翻倍 |
+| 板端改动 | 改 `face_proc` 现有进程（`setRegisterHost`）+ 重新部署 | 新增独立进程，**不动**现有四个进程 | B 的爆炸半径更小 |
+| 语言/工程 | C++ 库（STL 接口）→ 你的纯 C 工程要加 `.cpp` 包装层 + `extern "C"` 边界 | 纯 C socket，与现有 `comm_udp.c` 同构 | B 与现有代码风格一致 |
+| 双向控制 | ✅ 原生 RPC（`GetStatus`/`GetFrameCount`） | 需 bridge 代理 | 当前无控制需求 |
+| 调试 | 需懂框架 + 泵 `pollOnce` | `nc` / Python 直接看 JSON | B 明显更快 |
 
-**结论：走 B。** 若将来确实要从 PC 下发控制（调门限、切库），再让 bridge 代理 RPC 或补 A，不影响现有结构。
+**结论：产品主路径走 B。** 关键论据从「平台不支持」变成「**多路通道号 + 编码尺寸都要额外机制，而 B 天然具备**」。
+
+**但 A 现在值得顺手做一件事**：见 §4.7 —— 用它做一个 30 行的控制台探针，在板端联调期验证「数据对不对、坐标对不对」，成本极低。
+
 
 ### 4.2 板端（`3516-media-refactor`）：新增 `face_bridge`
 
@@ -155,9 +163,10 @@ face_proc ──FaceResult──> face_bridge ──JSON Lines over TCP:9100─�
    {"type":"hello","ver":1,"idl_hash":"0x368f4259","channel":0,"enc_w":1920,"enc_h":1080}
    {"type":"face","seq":12345,"det_count":2,"best_index":0,"matched":true,"name":"张三","cos":0.732,"dets":[{"s":0.98,"x1":210.5,"y1":320.1,"x2":360.2,"y2":500.8,"kps":[...]}],"fps":24.8,"det_ms":18.2,"mbf_ms":6.1,"dec_ms":4.3,"ts_us":123456789}
    ```
-   **hello 里的 `channel` 和 `enc_w/enc_h` 是文档里没有、但你必须有字段**（原因见 §4.4、§4.5）
-5. 打包进 `CMakeLists.txt` + `build_hi3516.sh`（参照 `face_mbf_probe`）
-6. bridge 是**订阅方**，连 `127.0.0.1:9900` 即可，**不需要 `setRegisterHost`**
+   **hello 里的 `channel` 和 `enc_w/enc_h` 是文档里没有、但你必须有字段**（原因见 §4.4、§4.6）
+5. **同时订阅 `FrameReady`**：`enc_w/enc_h` 只存在于 `frame_service.bidl` 的 `FrameReady.width/height`，FaceResult 里**没有**。bridge 缓存最近一帧的宽高，按 `seq` 合并进 `face` 消息（每帧都带，PC 端不需要自己做两路 topic 对齐）
+6. 打包进 `CMakeLists.txt` + `build_hi3516.sh`（参照 `face_mbf_probe`）
+7. bridge 是**订阅方**，连 `127.0.0.1:9900` 即可，**不需要 `setRegisterHost`**
 
 ### 4.3 PC 端：新增四个模块（不动现有页面）
 
@@ -190,7 +199,11 @@ UI 侧（两个都要，但**先做表格页**）：
         py2 = py1 * scale + off_y
 ```
 
-合并后 `px2 = x_canvas * (enc_w/640) * scale + off_x`。**`enc_w/enc_h` 必须来自 bridge hello（或 FFmpeg 实测），不能假设 1920×1080。**
+合并后 `px2 = x_canvas * (enc_w/640) * scale + off_x`。
+
+**`enc_w/enc_h` 的来源要写进设计**：它不在 FaceResult 里，而在 `FrameReady.width/height`（`frame_service.bidl`）。所以要么 bridge 合并下发（推荐，见 §4.2 第 5 条），要么 PC 端自己双订阅并对齐 `seq` —— 后者是实现复杂度的主要来源，也是本方案选 B 的核心原因之一。
+
+`pad_top = 140` 是固定常量（640 高度里 360 活动区居中），但如果板端改了 letterbox 策略就要跟着改，建议 bridge 也把它放进 hello。
 
 ### 4.5 两个语义陷阱（文档 §3.3、§9 强调，容易误判）
 
@@ -200,12 +213,42 @@ UI 侧（两个都要，但**先做表格页**）：
 
 ### 4.6 多路场景的真实缺口（需要你先拍板）
 
-FaceResult 只有 `seq / buffer_id`，**没有"这是哪一路摄像头"的字段**。而你的 multPlay 页是 4/6/8/9 路并存：
+FaceResult 只有 `seq / buffer_id`，**没有"这是哪一路摄像头"的字段**；`FrameReady` 结构里也没有（只有 `buffer_id/seq/width/height`）。而你的 multPlay 页是 4/6/8/9 路并存：
 
 - 如果板端 face_proc **只跑一路**（比如主码流）→ 那么 9 宫格只有一格能叠框，其余格不该显示脸
 - 如果板端**每路各跑一个 face_proc** → bridge 要起多个实例（不同端口）或订阅多个 topic，且必须在报文里带 `channel`
 
 **建议**：bridge 的 hello 带 `channel`（默认 0），每帧 `face` 消息也带 `channel`（可省，默认同 hello）；PC 端按 channel 路由到对应宫格。这样单路/多路都能兼容，不用改协议。
+
+### 4.7 方案 A 的正确用法：联调期探针（建议顺手做，1 小时）
+
+既然 Windows 已能编，「不做主路径」不等于「完全不用」。**强烈建议在动 PC 端代码之前，先编一个 30 行控制台探针**，用来回答两个最容易出错的问题：板端到底有没有数据、坐标到底对不对。
+
+```bash
+# 1) 生成客户端代码（必须用板端同一份 idl，否则 hash 不匹配被拒）
+cd F:/git-clone/OmniBinder/3516-media-refactor
+F:/git-clone/OmniBinder/build_win/target/bin/omni-idlc.exe \
+    -i idl/face_service.bidl -I idl/ -o ./generated_win --cpp
+
+# 2) 编译探针（注意 Windows 的坑）
+/c/msys64/ucrt64/bin/g++ -std=c++11 -O2 probe.cpp \
+    -I./generated_win -I F:/git-clone/OmniBinder/include \
+    -L F:/git-clone/OmniBinder/build_win/target/lib -lomnibinder \
+    -lws2_32 -lpthread -o probe.exe
+```
+
+探针只做三件事：
+
+1. 连 `rt.init("192.168.10.168", 9900)` + `proxy.connect()`，打印订阅是否成功（失败会直接告诉你 `topic_idl_mismatch` 还是连不上 SM）
+2. 在 `SubscribeFaceResult` 回调里**只打印**（不写盘、不做重活），确认 `seq` 递增、`det_count`、`best.name`、`perf` 是否符合预期
+3. 把原始 `x1/y1/x2/y2` 按 §4.4 公式手算一遍，跟板端 `/tmp/media.log` 里的 OSD 坐标对一对
+
+**前置条件（唯一一处板端改动）**：探针跑之前，板端 `face_proc` 必须已经调 `setRegisterHost(板IP)`，否则 SM 里登记的是 `127.0.0.1`，PC 连数据面必然超时（`data_connect_fallback`）。
+
+**为什么值得**：这一步能把「网络/认证/IDL/坐标」四类问题在最小代码量下一次性隔离掉。等 PC 端 UI 也接进来之后再发现坐标错了，你会分不清是 bridge 序列化错了、解析错了、还是换算错了。
+
+> 注意：探针是**一次性工具**，不要塞进 `src/`。放 `tools/probe/` 并在文档里记下编译命令，联调结束后可以留着复用。
+
 
 ---
 
@@ -223,7 +266,7 @@ FaceResult 只有 `seq / buffer_id`，**没有"这是哪一路摄像头"的字�
 
 ---
 
-## 6. 需要你先拍板的 5 件事
+## 6. 需要你先拍板的 6 件事
 
 | # | 决策 | 选项 / 影响 |
 |---|---|---|
@@ -232,12 +275,13 @@ FaceResult 只有 `seq / buffer_id`，**没有"这是哪一路摄像头"的字�
 | 3 | PC 端 JSON 方案 | vendor cJSON（省事、可扩展）/ 自定义 `sscanf` 文本（零依赖、更快，但扩展字段要改代码） |
 | 4 | 板端 IP 与端口 | 文档示例 `192.168.10.168:9100`，确认与现有服务不冲突、防火墙放通 |
 | 5 | 是否需要 PC→板 控制 | 决定 bridge 是否现在就把 RPC 代理做进去（建议先不做） |
+| 6 | 是否先做 §4.7 的探针 | 建议做（1 小时成本，能提前隔离网络/IDL/坐标三类问题）；做的话板端需先加 `setRegisterHost` |
 
 ---
 
 ## 7. 明确"现在不要做"的事（避免返工）
 
-1. **不要为了方案 A 迁到 Linux**：你整套 UI 是 Windows+MSYS2 编的，迁移成本远大于 bridge
+1. **不要因为方案 A 现在能编就改主线**：A 的 `channel` 与 `enc_w/enc_h` 两个缺口要靠改 IDL 或双订阅解决，代价比 bridge 高（详见 §4.1）
 2. **不要在网络线程/订阅回调里碰任何 `lv_*`**：LVGL 不是线程安全的，必须走事件队列 → 主循环
 3. **不要先做 OSD**：先让数字对，再让框对
 4. **不要用 `lv_canvas` 逐帧画框**：几张矩形用 `lv_obj` 叠加即可，CPU 差一个数量级
@@ -252,6 +296,8 @@ FaceResult 只有 `seq / buffer_id`，**没有"这是哪一路摄像头"的字�
 |---|---|
 | 对接文档（本路线依据） | `F:\git-clone\media-refactor-arch\docs\PC客户端订阅FaceResult-对接文档-20261103.md` |
 | IDL 契约 | `F:\git-clone\OmniBinder\3516-media-refactor\idl\face_service.bidl` |
+| **编码分辨率来源** | `...\idl\frame_service.bidl` 的 `FrameReady.width/height` |
+| Windows 版框架库（已核实存在） | `F:\git-clone\OmniBinder\build_win\target\lib\libomnibinder.a`（988K）、`...\target\bin\omni-idlc.exe`（637K） |
 | 订阅参考实现（板端） | `...\src\media_core\osd_face.cpp`（`OnFaceResult`） |
 | 发布参考实现（板端） | `...\src\face_core\face_proc_app.cpp`（`PublishReady`/`PublishNoFace`） |
 | 框架 API | `F:\git-clone\OmniBinder\docs\api-reference.md`、`threading-model.md` |
