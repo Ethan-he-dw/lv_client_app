@@ -12,8 +12,13 @@
 | 现在是什么 | **一个能演示的 UI 骨架**。四页导航、页面注册表、FFmpeg 播放、UDP 设备发现齐了，但：通信数据是模拟的、资源生命周期没人管、错误只是改个 label、配置全硬编码 |
 | 目标是什么 | **一个能长期挂着跑的产品客户端**：断线自愈、不崩不漏、能消费板端真实 FaceResult 并叠加到视频上 |
 | 两件事的先后 | **必须先稳定底座，再接数据**。理由：FaceResult 是持续高频数据流（板端 15~25fps），会放大现有的每一个资源/线程缺陷——底座不稳，接完只会从"偶发卡顿"变成"必崩" |
-| 关键决策 | 主线走 **bridge（TCP + JSON Lines）**。文档已修正：**方案 A 在 Windows/MSYS2 也实测可编**（本机 `libomnibinder.a` 988K、`omni-idlc.exe` 637K 已核实），但走 A 要付三项代价：双 topic 订阅、改 IDL 加通道号、侵入 face_proc。所以 A 降级为**联调探针**，不做产品主路径 |
-| 最大隐藏坑 | **FaceResult 和 FrameReady 都没有通道号**，多路时无法区分哪一路；而且**编码分辨率不在 FaceResult 里**（在 `FrameReady.width/height`）。bridge 必须合并两个 topic 并补 `channel` + `enc_w/enc_h`，否则 OSD 一定画错 |
+| 关键决策 | 主线走 **bridge（TCP + JSON Lines）**。文档已修正：A 在 Windows/MSYS2 也可编（本机 `libomnibinder.a` 988K 已核实）。而「只 Play 页 + 不需要同步」澄清后，A 原先的两项硬伤（双 topic 订阅、改 IDL 加通道号）**都不存在了**——所以 **B 仍更优，但优势收窄**，剩下三条真实差异：板端零侵入、对 IDL 变更免疫、纯 C 与现有工程一致。A 保留作联调探针（§4.7），将来要 RPC 再上 |
+| 真正要小心的地方 | 不是坐标，也不是分辨率，而是**「这条流」到底是哪条流**。嗅探只能证明该 IP 上有服务，不能证明它算的就是当前画面；必须靠 hello 的流标识 + 挥手目视验证（§4.6.3） |
+
+### 需求澄清（2026-11-03，影响本路线两处设计）
+
+1. **FaceResult 只在 Play 页使用**，且要按「当前播放码流的 IP」去嗅探 → 多路通道号需求作废，改为**流归属匹配**（§4.6）
+2. **不需要与画面同步**，Play 页已有 RTSP 画面 → 不需要 `seq` 对齐、不需要订阅 `FrameReady`，且 **`enc_w/enc_h` 在 PC 端会被数学约掉**（§4.4）；数据通路从「事件队列」改为「最新值单槽」（§4.3）
 
 ---
 
@@ -130,21 +135,23 @@
 
 ### 4.1 选型：A 已可行，但主路径仍应走 bridge
 
-文档已修正为「Windows/Linux 均已实测可编」，前提不再成立。**但「能编」不等于「该用」**，逐项比过之后结论没变，理由换成了下面三条硬约束：
+文档已修正为「Windows/Linux 均已实测可编」，平台这个前提不成立了。而在「只 Play 页 + 不同步」澄清之后，我上一版用来否定 A 的两条理由（多路通道号、编码分辨率）**也都不成立了**——单路不需要 channel，分辨率在 PC 端会被约掉（§4.4）。
+
+所以选型回归到真实差异上，**B 仍优但优势不大**：
 
 | 维度 | 方案 A（原生客户端） | 方案 B（bridge） | 对本项目的影响 |
 |---|---|---|---|
-| 平台可行性 | ✅ Windows/MSYS2 与 Linux x86 均可编 | ✅ 任意 | 打平（A 的前提障碍已消除） |
-| **通道标识** | ❌ IDL 里没有 `channel`；要加就得改 `.bidl` → `TOPIC_IDL_HASH` 变化 → **板端 media_proc/osd_face 必须同步重建** | ✅ JSON 里加一个字段零成本 | **A 对多路宫格是硬伤**，B 无痛 |
-| **编码分辨率** | ❌ 不在 FaceResult 里，必须**额外订阅 `FrameReady`** 取 `width/height`，再按 `seq` 对齐两路 topic | ✅ bridge 同时订阅两个 topic，合并成一行 JSON 下发 | A 的客户端要维护两路流的时间对齐，复杂度翻倍 |
-| 板端改动 | 改 `face_proc` 现有进程（`setRegisterHost`）+ 重新部署 | 新增独立进程，**不动**现有四个进程 | B 的爆炸半径更小 |
-| 语言/工程 | C++ 库（STL 接口）→ 你的纯 C 工程要加 `.cpp` 包装层 + `extern "C"` 边界 | 纯 C socket，与现有 `comm_udp.c` 同构 | B 与现有代码风格一致 |
-| 双向控制 | ✅ 原生 RPC（`GetStatus`/`GetFrameCount`） | 需 bridge 代理 | 当前无控制需求 |
-| 调试 | 需懂框架 + 泵 `pollOnce` | `nc` / Python 直接看 JSON | B 明显更快 |
+| 平台可行性 | ✅ Windows/MSYS2 与 Linux x86 均可编 | ✅ 任意 | 打平 |
+| 板端侵入 | ❌ 改 `face_proc` 这个**生产进程**（`setRegisterHost`）+ 重新部署固件 | ✅ 新增独立进程，四个现有进程**一行不动** | B 的爆炸半径更小，回归测试面更窄 |
+| IDL 耦合 | ❌ hash 不匹配即拒订；板端改 IDL 后 PC 必须重新生成 + 重编 | ✅ JSON 按字段取，板端加字段 PC 不用改 | 板端 IDL 还在演进（`face_policy` 已另起），B 更抗变更 |
+| PC 工程 | C++ 库 + STL 接口 → 纯 C 工程要 `.cpp` 包装 + `extern "C"` 边界 | ✅ 纯 C socket，与 `comm_udp.c` 同构 | 与现有代码风格一致，review 成本低 |
+| 部署依赖 | 要带 `libomnibinder.a`（第三方二进制）+ 生成的头进仓库 | ✅ 零第三方依赖 | 仓库干净 |
+| 调试 | 需懂框架 + 必须泵 `pollOnce` | ✅ `nc` / Python 直接看 JSON | 联调期差距明显 |
+| 双向控制 | ✅ 原生 RPC（`GetStatus`/`GetFrameCount`） | 需 bridge 代理 | 当前无需求 |
 
-**结论：产品主路径走 B。** 关键论据从「平台不支持」变成「**多路通道号 + 编码尺寸都要额外机制，而 B 天然具备**」。
+**结论：产品主路径走 B。** 判断依据从「A 做不到」变成「**B 在板端风险、协议演进、工程一致性三方面更划算，而 A 的独有优势（RPC）现在用不上**」。
 
-**但 A 现在值得顺手做一件事**：见 §4.7 —— 用它做一个 30 行的控制台探针，在板端联调期验证「数据对不对、坐标对不对」，成本极低。
+**A 现在值得顺手做一件事**：见 §4.7 —— 用 30 行控制台探针验证「板端有没有数据、坐标对不对」，1 小时成本。它和 B 不冲突，只作用于联调期。
 
 
 ### 4.2 板端（`3516-media-refactor`）：新增 `face_bridge`
@@ -158,13 +165,13 @@ face_proc ──FaceResult──> face_bridge ──JSON Lines over TCP:9100─�
 1. **回调只入队**：`SubscribeFaceResult` 回调里只 `push` 到无锁/加锁队列，**不做 send、不做序列化重活**（框架约束⑤，且避免 PC 慢导致回调阻塞）
 2. **独立发送线程**：从队列取 → 序列化 → `send(MSG_NOSIGNAL)`，慢客户端不拖累订阅
 3. **多客户端**：`poll()` + 客户端列表 + 每客户端发送队列；新连上先补 `hello`
-4. **协议**：JSON Lines（一行一帧）。建议首行 hello：
+4. **协议**：JSON Lines（一行一帧）。首行 hello 说明「我是谁、我算的是哪条流」：
    ```json
-   {"type":"hello","ver":1,"idl_hash":"0x368f4259","channel":0,"enc_w":1920,"enc_h":1080}
-   {"type":"face","seq":12345,"det_count":2,"best_index":0,"matched":true,"name":"张三","cos":0.732,"dets":[{"s":0.98,"x1":210.5,"y1":320.1,"x2":360.2,"y2":500.8,"kps":[...]}],"fps":24.8,"det_ms":18.2,"mbf_ms":6.1,"dec_ms":4.3,"ts_us":123456789}
+   {"type":"hello","ver":1,"idl_hash":"0x368f4259","venc_chn":0,"board":"192.168.10.168"}
+   {"type":"face","seq":12345,"det_count":2,"best_index":0,"matched":true,"name":"张三","cos":0.732,"dets":[{"s":0.98,"x1":210.5,"y1":320.1,"x2":360.2,"y2":500.8}],"fps":24.8,"det_ms":18.2,"mbf_ms":6.1,"dec_ms":4.3,"ts_us":123456789}
    ```
-   **hello 里的 `channel` 和 `enc_w/enc_h` 是文档里没有、但你必须有字段**（原因见 §4.4、§4.6）
-5. **同时订阅 `FrameReady`**：`enc_w/enc_h` 只存在于 `frame_service.bidl` 的 `FrameReady.width/height`，FaceResult 里**没有**。bridge 缓存最近一帧的宽高，按 `seq` 合并进 `face` 消息（每帧都带，PC 端不需要自己做两路 topic 对齐）
+   hello 用于 PC 端校验「连上的服务 = 这条流的结果」；`enc_w/enc_h` **不必下发**（原因见 §4.4）；`ch` 留作可选字段供将来 multPlay 使用（现在忽略）
+5. **不需要订阅 `FrameReady`**：编码分辨率在 PC 端会被约掉（§4.4）。只有将来要做「和板端 OSD 逐像素对账」时才需要它，属于校验需求，不是显示需求
 6. 打包进 `CMakeLists.txt` + `build_hi3516.sh`（参照 `face_mbf_probe`）
 7. bridge 是**订阅方**，连 `127.0.0.1:9900` 即可，**不需要 `setRegisterHost`**
 
@@ -172,38 +179,55 @@ face_proc ──FaceResult──> face_bridge ──JSON Lines over TCP:9100─�
 
 | 模块 | 职责 | 关键设计 |
 |---|---|---|
-| `src/comm/comm_tcp.c` | TCP 客户端 | 独立 rx 线程 + 行缓冲；断线指数退避重连（1s→2s→4s→…→30s）；心跳超时（3s 无 hello/face → Degraded） |
+| `src/comm/comm_face.c` | TCP 客户端 | 独立 rx 线程 + 行缓冲；**连接目标由 `do_play()` 触发的嗅探决定**（§4.6）；断线指数退避重连（1s→2s→4s→…→30s）；`stop/换 URL/离页` 主动断开 |
 | `src/core/json.c` | 极简 JSON 解析 | **建议直接 vendor cJSON**（2 个文件、MIT、成熟）；也可只写定长 `sscanf` 解析（协议自己定，够用且零依赖） |
 | `src/comm/face_proto.c` | 行 → `face_result_t` | 纯函数，便于单测；字段缺失要容错（旧版 bridge 兼容） |
-| `comm.c` 改造 | 接入新事件 | 增 `COMM_EVT_FACE_RESULT`、`COMM_EVT_LINK_STATE`；TCP 线程把事件 `queue_push` 进**同一个队列** |
+| `comm.c` 改造 | 事件接入 | 增 `COMM_EVT_LINK_STATE` 走队列；**FaceResult 不进队列**，用 §下方「最新值槽」 |
+
+**关键调整：FaceResult 不进事件队列，用「最新值单槽」。** 既然明确不需要和画面同步，那么排队列是错的——UI 每 50ms 轮询一次，队列里 25fps 的中间帧全是垃圾，而队列满（64 槽）还会丢帧、乱序风险。正确做法：
+
+```c
+/* 写侧（rx 线程）：覆盖式写入，永远只保留最新一帧 */
+void face_store_put(const face_result_t *r);   /* 内部加锁，覆写 + version++ */
+/* 读侧（UI 线程）：只在 version 变化时取一次 */
+bool face_store_get_if_new(face_result_t *out, uint32_t *last_version);
+```
+
+好处：UI 卡顿/掉帧时自动跳到最新结果（不同步场景下完全无损）、不会拥塞、无需处理乱序。**状态类事件（连上/断开/超时）仍走原来的队列**，它们需要保证不丢。
+
+**过期清除**：超过 2s 没有新结果（或连接断开）→ 立即隐藏所有框并置灰状态，否则会留下"鬼影框"停在画面上。
 
 UI 侧（两个都要，但**先做表格页**）：
 
 1. **数据验证优先**：新增 `APP_PAGE_FACE` 页，用 `lv_table` 显示近 N 帧：`seq / det_count / best_name / cos / fps / det_ms / mbf_ms`，顶部链路状态灯 + 收包速率。这一步能在没有 OSD 的情况下确认整条链路正确
 2. **再做 OSD 叠加**：`src/ui/ui_face_osd.c`，在播放器之上用 **`lv_obj` 矩形 + label** 画框（**不要用 `lv_canvas` 逐帧重绘**——每帧清屏+重画会吃掉大量 CPU，而框的数量只有几个）
 
-### 4.4 坐标换算：必须分两步，少一步框就歪
+### 4.4 坐标换算：PC 端不需要编码分辨率
 
-文档 §3.2 给的是**第一步**，你的场景还需要**第二步**：
+**先纠正一个常见误解**：板端的 OSD 需要 `enc_w/enc_h`，因为它把框画在**编码帧**上（`osd_face.cpp:63` 的 `sx = enc_w/640`，1920×1080 时正好 ×3）。但 PC 端是画在**控件**上，两步缩放会互相抵消：
 
 ```
-第一步：检测画布(640×640, pad_top=140) → 编码画面(enc_w×enc_h)
-        px1 = x_canvas * (enc_w / 640)
-        py1 = (y_canvas - 140) * (enc_h / 360)
-
-第二步：编码画面 → 播放器控件显示区（LV_IMAGE_ALIGN_CONTAIN 会留黑边）
-        scale  = min(w_widget / enc_w, h_widget / enc_h)
-        off_x  = (w_widget - enc_w * scale) / 2
-        off_y  = (h_widget - enc_h * scale) / 2
-        px2 = px1 * scale + off_x
-        py2 = py1 * scale + off_y
+px_enc  = x_canvas * (enc_w / 640)          ← 板端那一步
+px_disp = px_enc * (W_disp / enc_w)         ← 你再缩到控件
+        = x_canvas * W_disp / 640           ← enc_w 被约掉
 ```
 
-合并后 `px2 = x_canvas * (enc_w/640) * scale + off_x`。
+所以正确做法是**直接归一化**，不需要任何来自网络的分辨率：
 
-**`enc_w/enc_h` 的来源要写进设计**：它不在 FaceResult 里，而在 `FrameReady.width/height`（`frame_service.bidl`）。所以要么 bridge 合并下发（推荐，见 §4.2 第 5 条），要么 PC 端自己双订阅并对齐 `seq` —— 后者是实现复杂度的主要来源，也是本方案选 B 的核心原因之一。
+```
+u  = clamp(x_canvas / 640.0, 0, 1)
+v  = clamp((y_canvas - 140.0) / 360.0, 0, 1)
+px = X0 + u * W_disp
+py = Y0 + v * H_disp
+```
 
-`pad_top = 140` 是固定常量（640 高度里 360 活动区居中），但如果板端改了 letterbox 策略就要跟着改，建议 bridge 也把它放进 hello。
+- `640 / 360 / 140` 是**画布常量**（`frame_types.h`、`osd_face.cpp:50`），编译期写死即可
+- `X0/Y0/W_disp/H_disp` 是「视频在播放器控件里的实际矩形」，属于**本地信息**：
+  `lv_image_get_src_width/height(player)` 拿解码尺寸 → 按 `LV_IMAGE_ALIGN_CONTAIN` 算黑边 → 与控件尺寸求交
+- **前提前提**：画布活动区 640×360 与视频同宽高比（都是 16:9）。板端 `g_enc_w=1920/g_enc_h=1080/pad_top=140` 就是按 16:9 写死的，非 16:9 的流本来也不在支持范围（且按 §4.6 也嗅探不到结果）
+- 与板端保持一致的细节：框换算后 `< 4px` 丢弃（`osd_face.cpp:75`），否则小框会在画面上变成噪点
+
+**`enc_w/enc_h` 只在两个次要场景才需要**：①要和板端 OSD 逐像素对账；②校验「画布契约」是否被改（比如板端把 pad_top 变成动态计算）。这两个都不是显示路径的必需项，所以 **bridge 不必为了显示去订阅 `FrameReady`**。
 
 ### 4.5 两个语义陷阱（文档 §3.3、§9 强调，容易误判）
 
@@ -211,14 +235,45 @@ UI 侧（两个都要，但**先做表格页**）：
 2. **`ts_us` 是板端单调时钟**（上电起算）→ 只能算相对时间（相邻帧差），**不能**直接显示成日期时间；要显示"延迟"需 bridge 额外带一个板端 epoch 或由 PC 用收包时间估算
 3. 反向判定：**长时间（>2s）收不到任何 FaceResult** 才是异常 → 触发 Degraded 状态并尝试重连
 
-### 4.6 多路场景的真实缺口（需要你先拍板）
+### 4.6 流归属：只在 Play 页，按当前码流 IP 嗅探
 
-FaceResult 只有 `seq / buffer_id`，**没有"这是哪一路摄像头"的字段**；`FrameReady` 结构里也没有（只有 `buffer_id/seq/width/height`）。而你的 multPlay 页是 4/6/8/9 路并存：
+需求已澄清：**FaceResult 只服务 Play 页，且要按"当前正在播的那条流的 IP"去嗅探有没有识别结果**。这一条把原来的「多路通道号」问题直接作废——单路场景不需要 `channel`，需要的是**判断这条流和这份结果是不是同一路**。
 
-- 如果板端 face_proc **只跑一路**（比如主码流）→ 那么 9 宫格只有一格能叠框，其余格不该显示脸
-- 如果板端**每路各跑一个 face_proc** → bridge 要起多个实例（不同端口）或订阅多个 topic，且必须在报文里带 `channel`
+#### 4.6.1 嗅探规则
 
-**建议**：bridge 的 hello 带 `channel`（默认 0），每帧 `face` 消息也带 `channel`（可省，默认同 hello）；PC 端按 channel 路由到对应宫格。这样单路/多路都能兼容，不用改协议。
+```
+用户点 Play → do_play(url) 成功 →
+  ① 解析 url 的 host（rtsp://192.168.10.168:554/0 → 192.168.10.168）
+  ② 异步连接 host:9100（不阻塞 UI 线程，超时 800ms）
+  ③ 收到 hello → Connected；持续收到 face → Streaming
+  ④ 换 URL / 点 Stop / 离开 Play 页 → 断开连接 + 立即清空所有框
+```
+
+- 连接必须**异步**：`do_play()` 跑在 LVGL 主线程里，同步 connect 会卡画面 1 秒
+- 连不上**不报错**：把"这台设备没有人脸服务"当正常状态，状态栏显示"无识别结果"即可，不能弹窗打断播放
+- `hello` 里建议带 `stream` 标识（板端 `venc_chn` 或板 IP），PC 拿到后与当前 URL 的 host/通道比对，避免"连上了但不是这条流"的静默错配
+
+#### 4.6.2 一个会立刻踩到的现实问题
+
+你现在 Play 页默认地址是 `rtsp://192.168.10.248:555/stream1`，multPlay 用 `192.168.10.206/0`，而 face_proc 跑在板端 `.168`。**按流 IP 嗅探会全部失败**（.248/.206 上没有 9100 服务）。
+
+所以设计上必须留一个覆盖入口，建议优先级：
+
+```
+生效地址 = 配置里的 face_host（若填） > URL 的 host
+```
+
+配置项 `face_host` / `face_port` 放在 `config.json`，默认空（= 跟随流 IP）。这样：
+- 开发期（用 IPC 测试流 + 板端 face）→ 手动填 `.168`
+- 生产期（流就从板端出）→ 留空，自动嗅探
+
+#### 4.6.3 早期联调怎么验证「是不是同一条流」
+
+嗅探成功只证明"该 IP 上有服务"，不证明"它算的是这条流"。早期用 §4.7 的探针 + 一个动作就能确认：**在镜头前挥手**，看框是否跟着动、位置是否对得上画面。对不上就说明流不匹配（或坐标契约不对），这一步比读日志快得多。
+
+#### 4.6.4 如果将来 multPlay 也要显示
+
+那才需要 `channel`。协议上预留一个可选字段即可（`"ch":0`），PC 端现在忽略它，将来按它路由到宫格——不需要改协议结构，也不需要改板端 IDL。
 
 ### 4.7 方案 A 的正确用法：联调期探针（建议顺手做，1 小时）
 
@@ -271,7 +326,7 @@ F:/git-clone/OmniBinder/build_win/target/bin/omni-idlc.exe \
 | # | 决策 | 选项 / 影响 |
 |---|---|---|
 | 1 | bridge 谁写、在哪编 | 你写（我在 PC 侧配合给骨架代码）/ 已有同事在写。板端工具链是交叉编译，必须能编进 `build_hi3516.sh` |
-| 2 | 板端是否存在多路 face_proc | 决定 §4.6 要不要多实例 + channel 路由 |
+| 2 | 嗅探覆盖地址 | 现在测试流是 `.248`/`.206`（IPC），face 在 `.168` → 按流 IP 嗅探必然失败。开发期是否统一改成板端出流？否则必须手填 `face_host` |
 | 3 | PC 端 JSON 方案 | vendor cJSON（省事、可扩展）/ 自定义 `sscanf` 文本（零依赖、更快，但扩展字段要改代码） |
 | 4 | 板端 IP 与端口 | 文档示例 `192.168.10.168:9100`，确认与现有服务不冲突、防火墙放通 |
 | 5 | 是否需要 PC→板 控制 | 决定 bridge 是否现在就把 RPC 代理做进去（建议先不做） |
@@ -281,7 +336,7 @@ F:/git-clone/OmniBinder/build_win/target/bin/omni-idlc.exe \
 
 ## 7. 明确"现在不要做"的事（避免返工）
 
-1. **不要因为方案 A 现在能编就改主线**：A 的 `channel` 与 `enc_w/enc_h` 两个缺口要靠改 IDL 或双订阅解决，代价比 bridge 高（详见 §4.1）
+1. **不要因为方案 A 现在能编就改主线**：A 的独有优势（RPC）当前用不上，而它要动生产进程 `face_proc`、且强绑 IDL hash
 2. **不要在网络线程/订阅回调里碰任何 `lv_*`**：LVGL 不是线程安全的，必须走事件队列 → 主循环
 3. **不要先做 OSD**：先让数字对，再让框对
 4. **不要用 `lv_canvas` 逐帧画框**：几张矩形用 `lv_obj` 叠加即可，CPU 差一个数量级
