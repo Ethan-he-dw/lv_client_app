@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>生成佔位圖片</title>
+<style>
+  body {
+    background: #222;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    margin: 0;
+    font-family: sans-serif;
+    color: #fff;
+    gap: 20px;
+  }
+  canvas {
+    border: 1px solid #444;
+  }
+  button {
+    padding: 12px 32px;
+    font-size: 16px;
+    cursor: pointer;
+    background: #4CAF50;
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+  }
+  button:hover { background: #45a049; }
+  label { font-size: 14px; color: #aaa; }
+</style>
+</head>
+<body>
+
+<h2>黑底白字佔位圖生成器</h2>
+<div>
+  <label>寬度: <input id="w" type="number" value="1920" style="width:80px"></label>
+  <label style="margin-left:12px">高度: <input id="h" type="number" value="1080" style="width:80px"></label>
+  <label style="margin-left:12px">字號: <input id="fs" type="number" value="64" style="width:60px"></label>
+</div>
+<canvas id="cv" width="480" height="270"></canvas>
+<button id="btn">下載 PNG</button>
+
+<script>
+function draw() {
+  const w = +document.getElementById('w').value;
+  const h = +document.getElementById('h').value;
+  const fs = +document.getElementById('fs').value;
+  const cv = document.getElementById('cv');
+  const ctx = cv.getContext('2d');
+
+  cv.width = w;
+  cv.height = h;
+
+  // 黑色背景
+  ctx.fillStyle = '#000000';
+  ctx.fillRect(0, 0, w, h);
+
+  // 白色文字，居中
+  ctx.fillStyle = '#FFFFFF';
+  ctx.font = fs + 'px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('請輸入視頻源,並點擊播放', w / 2, h / 2);
+}
+
+document.getElementById('btn').addEventListener('click', () => {
+  draw();
+  const cv = document.getElementById('cv');
+  const a = document.createElement('a');
+  a.download = 'no_video_source.png';
+  a.href = cv.toDataURL('image/png');
+  a.click();
+});
+
+// 初始預覽
+draw();
+</script>
+</body>
+</html>

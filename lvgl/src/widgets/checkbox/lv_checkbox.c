@@ -1,0 +1,326 @@
+/**
+ * @file lv_checkbox.c
+ * @brief 复选框(checkbox)控件实现文件
+ *
+ */
+
+/*********************
+ *      INCLUDES
+ *      包含的头文件
+ *********************/
+
+#include "lv_checkbox_private.h"
+
+#if LV_USE_CHECKBOX
+
+#include "../../core/lv_obj_private.h"
+#include "../../core/lv_obj_class_private.h"
+#include "../../misc/lv_text_private.h"
+#include "../../misc/lv_text_ap.h"
+
+/*********************
+ *      DEFINES
+ *      宏定义
+ *********************/
+#define MY_CLASS (&lv_checkbox_class)
+
+/**********************
+ *      TYPEDEFS
+ *      类型定义
+ **********************/
+
+/**********************
+ *  STATIC PROTOTYPES
+ *  静态函数原型
+ **********************/
+static void lv_checkbox_constructor(const lv_obj_class_t * class_p, lv_obj_t * obj);
+static void lv_checkbox_destructor(const lv_obj_class_t * class_p, lv_obj_t * obj);
+static void lv_checkbox_event(const lv_obj_class_t * class_p, lv_event_t * e);
+static void lv_checkbox_draw(lv_event_t * e);
+
+/**********************
+ *  STATIC VARIABLES
+ *  静态变量
+ **********************/
+
+#if LV_USE_OBJ_PROPERTY
+static const lv_property_ops_t lv_checkbox_properties[] = {
+    {
+        .id = LV_PROPERTY_CHECKBOX_TEXT,
+        .setter = lv_checkbox_set_text,
+        .getter = lv_checkbox_get_text,
+    },
+};
+#endif
+
+const lv_obj_class_t lv_checkbox_class = {
+    .constructor_cb = lv_checkbox_constructor,
+    .destructor_cb = lv_checkbox_destructor,
+    .event_cb = lv_checkbox_event,
+    .width_def = LV_SIZE_CONTENT,
+    .height_def = LV_SIZE_CONTENT,
+    .group_def = LV_OBJ_CLASS_GROUP_DEF_TRUE,
+    .instance_size = sizeof(lv_checkbox_t),
+    .base_class = &lv_obj_class,
+    .name = "lv_checkbox",
+    LV_PROPERTY_CLASS_FIELDS(checkbox, CHECKBOX)
+};
+
+/**********************
+ *      MACROS
+ *      宏
+ **********************/
+
+/**********************
+ *   GLOBAL FUNCTIONS
+ *  全局函数
+ **********************/
+
+/* 创建复选框对象 */
+lv_obj_t * lv_checkbox_create(lv_obj_t * parent)
+{
+    LV_LOG_INFO("begin");
+    lv_obj_t * obj = lv_obj_class_create_obj(MY_CLASS, parent);
+    lv_obj_class_init_obj(obj);
+    return obj;
+}
+
+/*=====================
+ * Setter functions
+ * 设置函数
+ *====================*/
+
+/* 设置复选框的文本 */
+void lv_checkbox_set_text(lv_obj_t * obj, const char * txt)
+{
+    lv_checkbox_t * cb = (lv_checkbox_t *)obj;
+
+    if(NULL != txt) {
+        size_t len;
+
+#if LV_USE_ARABIC_PERSIAN_CHARS
+        len = lv_text_ap_strlen(txt) + 1;
+#else
+        len = lv_strlen(txt) + 1;
+#endif
+
+        if(!cb->static_txt) cb->txt = lv_realloc(cb->txt, len);
+        else cb->txt = lv_malloc(len);
+
+        LV_ASSERT_MALLOC(cb->txt);
+        if(NULL == cb->txt) return;
+
+#if LV_USE_ARABIC_PERSIAN_CHARS
+        lv_text_ap_proc(txt, cb->txt);
+#else
+        lv_strcpy(cb->txt, txt);
+#endif
+
+        cb->static_txt = 0;
+    }
+
+    lv_obj_refresh_self_size(obj);
+    lv_obj_invalidate(obj);
+}
+
+/* 设置复选框的静态文本(不复制字符串) */
+void lv_checkbox_set_text_static(lv_obj_t * obj, const char * txt)
+{
+    lv_checkbox_t * cb = (lv_checkbox_t *)obj;
+
+    if(!cb->static_txt) lv_free(cb->txt);
+
+    cb->txt = (char *)txt;
+    cb->static_txt = 1;
+
+    lv_obj_refresh_self_size(obj);
+    lv_obj_invalidate(obj);
+}
+
+/*=====================
+ * Getter functions
+ * 获取函数
+ *====================*/
+
+/* 获取复选框的文本 */
+const char * lv_checkbox_get_text(const lv_obj_t * obj)
+{
+    lv_checkbox_t * cb = (lv_checkbox_t *)obj;
+    return cb->txt;
+}
+
+/**********************
+ *   STATIC FUNCTIONS
+ *  静态函数
+ **********************/
+
+/* 复选框构造函数:设置默认文本并配置可点击/可选中属性 */
+static void lv_checkbox_constructor(const lv_obj_class_t * class_p, lv_obj_t * obj)
+{
+    LV_UNUSED(class_p);
+    LV_TRACE_OBJ_CREATE("begin");
+
+    lv_checkbox_t * cb = (lv_checkbox_t *)obj;
+
+#if LV_WIDGETS_HAS_DEFAULT_VALUE
+    cb->txt = (char *)"Check box";
+    cb->static_txt = 1;
+#else
+    cb->txt = (char *)"";
+    cb->static_txt = 1;
+#endif
+
+    lv_obj_set_clickable(obj, true);
+    lv_obj_set_checkable(obj, true);
+    lv_obj_set_scroll_on_focus(obj, true);
+    lv_obj_set_scrollable(obj, false);
+
+    LV_TRACE_OBJ_CREATE("finished");
+}
+
+/* 复选框析构函数:释放动态文本内存 */
+static void lv_checkbox_destructor(const lv_obj_class_t * class_p, lv_obj_t * obj)
+{
+    LV_UNUSED(class_p);
+    LV_TRACE_OBJ_CREATE("begin");
+
+    lv_checkbox_t * cb = (lv_checkbox_t *)obj;
+    if(!cb->static_txt) {
+        lv_free(cb->txt);
+        cb->txt = NULL;
+    }
+    LV_TRACE_OBJ_CREATE("finished");
+}
+
+/* 复选框事件处理:计算自身尺寸、扩展绘制区域并触发绘制 */
+static void lv_checkbox_event(const lv_obj_class_t * class_p, lv_event_t * e)
+{
+    LV_UNUSED(class_p);
+
+    lv_result_t res;
+    /*Call the ancestor's event handler*/
+    /*调用祖先类的事件处理函数*/
+    res = lv_obj_event_base(MY_CLASS, e);
+    if(res != LV_RESULT_OK) return;
+
+    lv_event_code_t code = lv_event_get_code(e);
+    lv_obj_t * obj = lv_event_get_current_target(e);
+
+    if(code == LV_EVENT_GET_SELF_SIZE) {
+        lv_point_t * p = lv_event_get_param(e);
+        lv_checkbox_t * cb = (lv_checkbox_t *)obj;
+
+        const lv_font_t * font = lv_obj_get_style_text_font(obj, LV_PART_MAIN);
+        int32_t font_h = lv_font_get_line_height(font);
+        lv_text_attributes_t attributes = {0};
+
+        attributes.line_space = lv_obj_get_style_text_line_space(obj, LV_PART_MAIN);
+        attributes.letter_space = lv_obj_get_style_text_letter_space(obj, LV_PART_MAIN);
+        attributes.max_width = LV_COORD_MAX;
+        attributes.text_flags = LV_TEXT_FLAG_NONE;
+
+        lv_point_t txt_size;
+
+        lv_text_get_size_attributes(&txt_size, cb->txt, font, &attributes);
+
+        int32_t bg_colp = lv_obj_get_style_pad_column(obj, LV_PART_MAIN);
+        int32_t marker_leftp = lv_obj_get_style_pad_left(obj, LV_PART_INDICATOR);
+        int32_t marker_rightp = lv_obj_get_style_pad_right(obj, LV_PART_INDICATOR);
+        int32_t marker_topp = lv_obj_get_style_pad_top(obj, LV_PART_INDICATOR);
+        int32_t marker_bottomp = lv_obj_get_style_pad_bottom(obj, LV_PART_INDICATOR);
+        lv_point_t marker_size;
+        marker_size.x = font_h + marker_leftp + marker_rightp;
+        marker_size.y = font_h + marker_topp + marker_bottomp;
+
+        p->x = marker_size.x + txt_size.x + bg_colp;
+        p->y = LV_MAX(marker_size.y, txt_size.y);
+    }
+    else if(code == LV_EVENT_REFR_EXT_DRAW_SIZE) {
+        int32_t * s = lv_event_get_param(e);
+        int32_t m = lv_obj_calculate_ext_draw_size(obj, LV_PART_INDICATOR);
+        *s = LV_MAX(*s, m);
+    }
+    else if(code == LV_EVENT_DRAW_MAIN) {
+        lv_checkbox_draw(e);
+    }
+}
+
+/* 复选框绘制回调:绘制指示器方块与文本 */
+static void lv_checkbox_draw(lv_event_t * e)
+{
+    lv_obj_t * obj = lv_event_get_current_target(e);
+    lv_checkbox_t * cb = (lv_checkbox_t *)obj;
+
+    lv_layer_t * layer = lv_event_get_layer(e);
+    const lv_font_t * font = lv_obj_get_style_text_font(obj, LV_PART_MAIN);
+    int32_t font_h = lv_font_get_line_height(font);
+
+    const bool is_rtl = LV_BASE_DIR_RTL == lv_obj_get_style_base_dir(obj, LV_PART_MAIN);
+
+    int32_t bg_border = lv_obj_get_style_border_width(obj, LV_PART_MAIN);
+    int32_t bg_topp = lv_obj_get_style_pad_top(obj, LV_PART_MAIN) + bg_border;
+    int32_t bg_p = is_rtl ? lv_obj_get_style_pad_right(obj, LV_PART_MAIN) : lv_obj_get_style_pad_left(obj,
+                                                                                                      LV_PART_MAIN) + bg_border;
+    int32_t bg_colp = lv_obj_get_style_pad_column(obj, LV_PART_MAIN);
+
+    int32_t marker_leftp = lv_obj_get_style_pad_left(obj, LV_PART_INDICATOR);
+    int32_t marker_rightp = lv_obj_get_style_pad_right(obj, LV_PART_INDICATOR);
+    int32_t marker_topp = lv_obj_get_style_pad_top(obj, LV_PART_INDICATOR);
+    int32_t marker_bottomp = lv_obj_get_style_pad_bottom(obj, LV_PART_INDICATOR);
+
+    int32_t transf_w = lv_obj_get_style_transform_width(obj, LV_PART_INDICATOR);
+    int32_t transf_h = lv_obj_get_style_transform_height(obj, LV_PART_INDICATOR);
+
+    lv_draw_rect_dsc_t indic_dsc;
+    lv_draw_rect_dsc_init(&indic_dsc);
+    indic_dsc.base.layer = layer;
+    lv_obj_init_draw_rect_dsc(obj, LV_PART_INDICATOR, &indic_dsc);
+    lv_area_t marker_area;
+    if(is_rtl) {
+        marker_area.x2 = obj->coords.x2 - bg_p;
+        marker_area.x1 = marker_area.x2 - font_h - marker_leftp - marker_rightp + 1;
+    }
+    else {
+        marker_area.x1 = obj->coords.x1 + bg_p;
+        marker_area.x2 = marker_area.x1 + font_h + marker_leftp + marker_rightp - 1;
+    }
+    marker_area.y1 = obj->coords.y1 + bg_topp;
+    marker_area.y2 = marker_area.y1 + font_h + marker_topp + marker_bottomp - 1;
+
+    lv_area_t marker_area_transf;
+    lv_area_copy(&marker_area_transf, &marker_area);
+    lv_area_increase(&marker_area_transf, transf_w, transf_h);
+
+    lv_draw_rect(layer, &indic_dsc, &marker_area_transf);
+
+    lv_text_attributes_t attributes = {0};
+    attributes.line_space = lv_obj_get_style_text_line_space(obj, LV_PART_MAIN);
+    attributes.letter_space = lv_obj_get_style_text_letter_space(obj, LV_PART_MAIN);
+    attributes.text_flags = LV_TEXT_FLAG_NONE;
+    attributes.max_width = LV_COORD_MAX;
+
+    lv_point_t txt_size;
+    lv_text_get_size_attributes(&txt_size, cb->txt, font, &attributes);
+
+    lv_draw_label_dsc_t txt_dsc;
+    lv_draw_label_dsc_init(&txt_dsc);
+    txt_dsc.base.layer = layer;
+    lv_obj_init_draw_label_dsc(obj, LV_PART_MAIN, &txt_dsc);
+    txt_dsc.text = cb->txt;
+
+    int32_t y_ofs = (lv_area_get_height(&marker_area) - font_h) / 2;
+    lv_area_t txt_area;
+    if(is_rtl) {
+        txt_area.x2 = marker_area.x1 - bg_colp;
+        txt_area.x1 = txt_area.x2 - txt_size.x;
+    }
+    else {
+        txt_area.x1 = marker_area.x2 + bg_colp;
+        txt_area.x2 = txt_area.x1 + txt_size.x;
+    }
+    txt_area.y1 = obj->coords.y1 + bg_topp + y_ofs;
+    txt_area.y2 = txt_area.y1 + txt_size.y;
+
+    lv_draw_label(layer, &txt_dsc, &txt_area);
+}
+#endif
