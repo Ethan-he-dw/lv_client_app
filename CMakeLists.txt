@@ -71,7 +71,8 @@ add_compile_definitions($<$<BOOL:${LV_USE_FFMPEG}>:LV_USE_FFMPEG=1>)
 add_subdirectory(lvgl)
 set(UI_SER ${PROJECT_SOURCE_DIR}/src/ui)
 set(COMM_SER ${PROJECT_SOURCE_DIR}/src/comm)
-target_include_directories(lvgl PUBLIC ${PROJECT_SOURCE_DIR} ${SDL2_INCLUDE_DIRS} ${UI_SER} ${COMM_SER})
+set(IVS_SER ${PROJECT_SOURCE_DIR}/src/ivs)
+target_include_directories(lvgl PUBLIC ${PROJECT_SOURCE_DIR} ${SDL2_INCLUDE_DIRS} ${UI_SER} ${COMM_SER} ${IVS_SER})
 
 # Use GLOB to auto-include every C file under src/ui and src/comm,
 # so newly added UI pages / comm modules are picked up automatically.
@@ -79,8 +80,36 @@ set(MAIN_SOURCES src/mouse_cursor_icon.c src/hal/hal.c)
 file(GLOB UI_SOURCES "${PROJECT_SOURCE_DIR}/src/ui/*.c")
 file(GLOB COMM_SOURCES "${PROJECT_SOURCE_DIR}/src/comm/*.c")
 list(APPEND MAIN_SOURCES ${UI_SOURCES} ${COMM_SOURCES})
-list(APPEND MAIN_SOURCES ${UI_SOURCES} ${COMM_SOURCES})
 set(MAIN_LIBS lvgl lvgl::examples lvgl::demos lvgl::thorvg ${SDL2_LIBRARIES})
+
+# ---- IVS：NPU 结果订阅（mock 恒编；找到 OmniBinder 才加真机实现） ----
+# 库不提交进仓：路径由 cache 变量给出，缺失时自动降级为 mock，保证任意机器可编。
+set(OMNIBINDER_ROOT "F:/git-clone/OmniBinder" CACHE PATH "OmniBinder 源码/构建根目录")
+set(IVS_GEN_DIR "${PROJECT_SOURCE_DIR}/src/ivs/generated")
+set(OMNIBINDER_LIB "${OMNIBINDER_ROOT}/build_win/target/lib/libomnibinder.a")
+
+file(GLOB IVS_SOURCES "${PROJECT_SOURCE_DIR}/src/ivs/*.c")
+if(EXISTS "${OMNIBINDER_ROOT}/include/omnibinder/omnibinder.h"
+   AND EXISTS "${OMNIBINDER_LIB}"
+   AND EXISTS "${PROJECT_SOURCE_DIR}/src/ivs/ivs_src_omnibinder.cpp")
+    message(STATUS "IVS: 启用 omnibinder 源（${OMNIBINDER_LIB}）")
+    list(APPEND IVS_SOURCES
+         "${PROJECT_SOURCE_DIR}/src/ivs/ivs_src_omnibinder.cpp"
+         "${PROJECT_SOURCE_DIR}/src/ivs/ivs_task_face.cpp")
+    if(EXISTS "${IVS_GEN_DIR}/face_service.bidl.cpp")
+        list(APPEND IVS_SOURCES
+             "${IVS_GEN_DIR}/face_service.bidl.cpp"
+             "${IVS_GEN_DIR}/common_types.bidl.cpp")
+    else()
+        message(WARNING "IVS: 缺少生成代码 ${IVS_GEN_DIR}，请先运行 omni-idlc")
+    endif()
+    target_include_directories(lvgl PUBLIC "${OMNIBINDER_ROOT}/include" "${IVS_GEN_DIR}")
+    list(APPEND MAIN_LIBS "${OMNIBINDER_LIB}")
+    add_compile_definitions(IVS_SRC_OMNIBINDER=1)
+else()
+    message(STATUS "IVS: 未找到 OmniBinder → 仅编 mock 实现")
+endif()
+list(APPEND MAIN_SOURCES ${IVS_SOURCES})
 # Create the main executable, depending on the FreeRTOS option
 if(USE_FREERTOS)
     list(APPEND MAIN_SOURCES src/freertos_main.c src/freertos/freertos_posix_port.c ${FREERTOS_SOURCES})

@@ -23,6 +23,12 @@ typedef enum {
 /* ===================== 布局常量 ===================== */
 #define APP_SIDEBAR_W   160
 #define APP_PAGE_PAD    10
+#define APP_PLAYER_TOP  90      /* 播放器/面板距页面上沿 */
+#define APP_PLAYER_H    720     /* 播放区与右侧面板高度 */
+#define APP_PANEL_W     400     /* NPU 结果面板宽度 */
+
+/* ===================== 识别服务（IVS） ===================== */
+#define APP_IVS_PORT    9900    /* 板端 service_manager 端口（框架默认） */
 
 /* ===================== 主题色 ===================== */
 #define APP_COLOR_SCREEN   lv_color_hex(0x1a1d21)

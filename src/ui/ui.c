@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdlib.h>
 
 /* ===================== 页面注册表 ===================== */
 /* 新增页面：在 ui_app.h 的 app_page_id_t 枚举中登记索引，
@@ -268,7 +269,18 @@ void ui_init(void)
     /* 一次性創建三個頁面*/
     app_pages_create();
 
-    app_show_page(APP_PAGE_MULTPLAY);
+    /* 默认页：可用环境变量 APP_START_PAGE 覆盖（play/upgrade/debug/multplay），
+     * 便于调试与自动化截图；未设置时保持原行为（multPlay）。 */
+    {
+        int start = APP_PAGE_MULTPLAY;
+        const char *env = getenv("APP_START_PAGE");
+        if(env != NULL) {
+            if(strcmp(env, "play") == 0)         start = APP_PAGE_PLAY;
+            else if(strcmp(env, "upgrade") == 0) start = APP_PAGE_UPGRADE;
+            else if(strcmp(env, "debug") == 0)   start = APP_PAGE_DEBUG;
+        }
+        app_show_page(start);
+    }
 
     app_poll_timer_init();
 }
