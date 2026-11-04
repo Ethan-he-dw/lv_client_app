@@ -28,10 +28,12 @@
 
 | # | 改动 | 文件 | 行数 |
 |---|------|------|------|
+| D0 | **前置核查**（SM/media_proc 在跑、板 IP 与 PC 同网段、旧 face_proc 已停、日志目录可写） | 无代码，见 §3.0 / §5.2 | 0 |
 | D1 | 新增 `GetBoardAdvertiseIp()`（读环境变量） | `face_proc_app.cpp` 匿名命名空间 | +12 |
 | D2 | `Init()` 中 `rt_.init()` 之后、`registerService()` 之前调 `setRegisterHost` | 同上（141~147 之间） | +3 |
 | D3 | advertise 结果日志（应用侧可观测） | 同上 | +1 |
 | D4（可选） | 框架侧加 advertise INFO 日志（3 行，独立提交） | `OmniBinder/src/core/runtime_service.cpp:79` | +3 |
+| **D5（建议）** | **face_proc 加 single-instance flock**（复用 media_proc 实现） | `apps/face_proc/main.cpp` | **+14** |
 
 ### 1.3 范围外（不做）
 
@@ -102,6 +104,18 @@ advertise_host = resolveRegisterHost(service, listenerAdvertiseHost());
 ---
 
 ## 3. 详细设计
+
+### 3.0 D0：前置核查（不写代码，但漏了会白跑）
+
+| # | 检查项 | 判据 / 命令 | 漏掉的后果 |
+|---|---|---|---|
+| 1 | 板 IP 与 PC 同网段、PC 可达 | 板端 `ip addr` → PC 侧 `ping <板IP>` | advertise 设对了也不通，白查一轮 |
+| 2 | `service_manager` 在跑 | `pgrep -x service_manager` | `rt_.init` 直接失败（`Init` 返回 1） |
+| 3 | `media_proc` 在跑 | `pgrep -x media_proc` | 能订阅但**永远没有 FaceResult**，会被误判成"跨机失败" |
+| 4 | 旧 `face_proc` 已退出 | `pgrep -x face_proc` 为空 | 双实例争注册，advertise 可能是旧值（见 D5） |
+| 5 | `/var/log/media_ipc/` 可写 | `ls -ld /var/log/media_ipc` | 验证时 grep 不到日志，误判"改动没生效" |
+
+> 这 5 项是部署方（现场）责任，程序不校验（§2.0 假设 A1~A3）。**第 3 项最容易被忽略**：SM 和 face_proc 都在跑但 media_proc 没起时，链路"看起来全绿"，只是永远收不到结果。
 
 ### 3.1 D1：`GetBoardAdvertiseIp()` 工具函数
 
@@ -206,6 +220,112 @@ std::string GetBoardAdvertiseIp() {
 | 风险 | 极低（只在服务注册时打印一次，非热路径） |
 | 提交 | **独立提交**，与业务改动分离（框架仓 vs 业务仓） |
 
+### 3.5 D5：face_proc 加 single-instance 锁（建议，防双实例导致 advertise 假象）
+
+#### 为什么需要
+
+| 事实 | 影响 |
+|------|------|
+| `AcquireSingleInstanceLock()` **只在 media_proc**（`main.cpp:35/45/69`），face_proc 无任何锁 | 可以同时起两个 face_proc |
+| 两个实例都会 `registerService("FaceService")` | SM 侧后注册者覆盖/并存 → `omni-cli info` 看到的 advertise **可能是旧实例的 127.0.0.1** |
+| 现象 | 「日志明明打印了 `advertise host=192.168.x.x`，但 `omni-cli` 还是 127.0.0.1」——**最难查的一类** |
+| 为什么不用 `pidof`/`pgrep` 兜底 | media_proc 注释原话：**「pidof 有竞态（两个实例同时起可同时通过），flock 是原子的」**；部署脚本的 `pgrep` 复核只能挡住"没杀掉"，挡不住"并发起两次" |
+
+#### 实现（完整代码，可直接粘贴到 `apps/face_proc/main.cpp`）
+
+```cpp
+#include <sys/file.h>   /* flock */
+#include <fcntl.h>      /* open */
+#include <unistd.h>     /* close */
+
+/** 单实例锁：进程退出（含 kill -9）内核自动释放，不留陈旧状态。
+ *  照搬 media_proc 的实现（apps/media_proc/main.cpp:35）——注意那个函数是 static，
+ *  无法跨文件链接，只能复制；要真复用需抽到 src/common/ 共用（会动 media_proc，超出本方案范围）。
+ *
+ *  三处与 media_proc 保持一致、但容易被"改好改坏"的点：
+ *   ① **不加 O_CLOEXEC**：若本进程后续 exec 子进程，O_CLOEXEC 会让锁在 exec 后静默释放，
+ *      判重形同虚设；不带该标志，锁才随主进程存活期。
+ *   ② **open 失败不阻塞启动**：/tmp 只读等环境问题 ≠ "已有实例在跑"，降级为告警继续
+ *      （失去判重但不会把启动卡死）。media_proc 也是这么处理的。
+ *   ③ 写 pid 进锁文件，仅供诊断（`cat /tmp/.face_proc.lock` 看到占用者）。
+ */
+static int AcquireSingleInstanceLock(void) {
+    static int s_fd = -1;
+    const char* path = getenv("FACE_PROC_LOCK");          /* 便于测试时指向临时文件 */
+    if (path == NULL || *path == '\0') path = "/tmp/.face_proc.lock";
+
+    int fd = open(path, O_RDWR | O_CREAT, 0644);          /* 无 O_CLOEXEC，见 ① */
+    if (fd < 0) {
+        MIPC_LOG_WARN("[face] 单实例锁不可用(%s) ⇒ 跳过判重，继续启动", path);
+        return 0;                                          /* 见 ②：降级而非失败 */
+    }
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        MIPC_LOG_ERROR("[face] 已有 face_proc 持有 %s ⇒ 拒绝启动（rc=4）", path);
+        (void)close(fd);
+        return -1;
+    }
+    char buf[32];
+    int n = snprintf(buf, sizeof(buf), "%d\n", (int)getpid());
+    if (n > 0) { ssize_t wr = write(fd, buf, (size_t)n); (void)wr; }
+
+    s_fd = fd;                                            /* 持有到进程退出 */
+    MIPC_LOG_INFO("[face] 单实例锁已获取: %s (pid=%d)", path, (int)getpid());
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    mediaipc::FaceCliOptions opt;
+    if (mediaipc::ParseFaceCli(argc, argv, &opt) != 0) return 2;
+    if (opt.cmd == mediaipc::FaceCmd::kHelp) { mediaipc::PrintUsage(argv[0]); return 0; }
+    if (opt.cmd != mediaipc::FaceCmd::kRun) return mediaipc::RunGalleryTool(opt);
+
+    mediaipc_log_init("face_proc", CEANIC_LOG_MODE_FILE | CEANIC_LOG_MODE_CONSOLE,
+                      CEANIC_LOG_INFO, "/var/log/media_ipc/face_proc.log");   /* :35 */
+    atexit(mediaipc_log_shutdown);
+
+    /* ★ D5：锁放在**日志就绪之后、任何 MPP/OmniRuntime 初始化之前**
+     *   → 拒绝启动的原因能落进 /var/log/media_ipc/face_proc.log（用 stderr 则进不了文件）
+     *   → 仍在 FaceProcApp 构造与 Init() 之前，满足"一个 MPP 接口都不调"
+     *   注：库工具（--gallery-*）在上面已 return，不经过判重——这是有意的：
+     *       否则 face_proc 在跑时 `--gallery-list` 会被误挡。 */
+    if (AcquireSingleInstanceLock() != 0) return 4;       /* 4 = 重复实例（区分 0/1/2/3） */
+
+    ...（原有逻辑：cfg 装配 → app.Init() → app.Run()）
+}
+```
+
+#### 退出码表（face_proc 现状 + 新增）
+
+| 码 | 含义 | 来源 |
+|----|------|------|
+| 0 | 正常（识别模式退出 / 注册成功） | 现状 |
+| 1 | `Init()` 失败（模型/MMZ/OmniRuntime） | 现状 |
+| 2 | 用法错误 / 注册失败 | 现状（`ParseFaceCli` 非 0 与 `EnrollSucceeded()==false` 复用，历史遗留） |
+| 3 | 库工具失败（gallery list/remove/clear） | 现状 |
+| **4** | **重复实例（锁被占用）** | **D5 新增** |
+
+> 用 4 而不是 2：`2` 在 face_proc 里已被"用法错误/注册失败"占用，复用它会让脚本误判。
+
+#### 验证
+
+```bash
+# 第一实例
+FACE_REGISTER_HOST=192.168.10.168 ./face_proc <参数> & 
+sleep 2
+# 第二实例（应立刻退出，码 4，stderr 有 "another instance is running"）
+FACE_REGISTER_HOST=192.168.10.168 ./face_proc <参数>;  echo "rc=$?"     # 期望 rc=4
+# kill -9 后锁自动释放：再起应成功
+kill -9 $(pidof face_proc); sleep 1; ./face_proc <参数> & sleep 2; pidof face_proc
+```
+
+#### 风险
+
+| 项 | 评估 |
+|----|------|
+| 正常路径影响 | 一次 `open`+`flock`（微秒级），media_proc 已长期使用同一实现 |
+| 误伤 | 若现场有"同时跑两个 face_proc 做 A/B"的临时习惯 → 会被挡住（**这正是期望行为**） |
+| 陈旧锁 | flock 随进程退出释放（含 `kill -9`），**不会**留下"锁文件还在但无进程"的死锁 |
+
 ---
 
 ## 4. 完整 diff（业务仓）
@@ -289,7 +409,7 @@ FACE_REGISTER_HOST=192.168.10.168 ./face_proc \
   /root/nfs/faceRec/insightface/models/cheetah_s/det_500m.om \
   /root/nfs/faceRec/insightface/models/cheetah_s/w600k_mbf.om \
   /root/nfs/faceRec/insightface/w3_demo/mbf_recog/build/bin/dw-workers 0.7 0.5 \
-  > /tmp/face.log 2>&1 &
+  > /tmp/face.log 2>&1 &   # 仅本地调试用；进程自身也会写 /var/log/media_ipc/face_proc.log
 ```
 
 > 如果现场用固定脚本起栈（`scripts/run_phase1_board.sh` 等），则在脚本里 export，不要每次手敲。
@@ -350,7 +470,7 @@ FACE_REGISTER_HOST=192.168.10.168 ./face_proc \
 
 - **SHM 失败 fallback**：`/dev/shm` 满或残留段 ⇒ 同机订阅走 TCP（用 advertise 地址）。此时 **advertise 必须正确**，否则板内 OSD 也会挂。排查时优先看 `data_connect_fallback`。
 - **face_proc 重启**：SM 里会重新登记新 advertise；**PC 端不需要手动重订阅**——框架在 SM 重连时会遍历已订阅 topic 自动重放（`runtime_sm.cpp:362-371` 调 `restoreSubscribeTopic()`），发布方重启时 SM 还会回推 publisher notify 重建数据通路（`runtime_topic.cpp:339` 注释）；重复订阅按幂等处理，只告警（`runtime_topic.cpp:344-352`）。PC 端只需观察数据是否恢复，30s 未恢复再走掉线重连。
-- **多实例**：⚠ **face_proc 没有单实例保护**（全仓无 flock/O_EXCL/"already running" 检查）。启动前必须确认旧进程已退出（见 §5.2 的 `pgrep` 复核），否则两个实例同时注册同名服务，advertise 行为不可预期。将来多板接入时，PC 端按不同 SM 地址区分。
+- **多实例**：⚠ **face_proc 自身没有单实例保护**（`AcquireSingleInstanceLock` 只存在于 `apps/media_proc/main.cpp:35`）。当前只能靠 §5.2 的 `pgrep` 复核兜底，但 `pgrep` 有竞态（两个实例同时起可同时通过）——彻底解决靠 **D5（flock）**。将来多板接入时，PC 端按不同 SM 地址区分。
 
 ### 7.3 回滚
 
@@ -395,7 +515,7 @@ FACE_REGISTER_HOST=192.168.10.168 ./face_proc \
 
 ## 10. 验收标准（Definition of Done）
 
-- [ ] `grep "advertise host" /tmp/face.log` 输出板 IP
+- [ ] `grep "advertise host" /var/log/media_ipc/face_proc.log` 输出板 IP（现场脚本起栈的日志就在此文件）
 - [ ] `omni-cli info FaceService` 的 `Host` = 板 IP（非 127.0.0.1）
 - [ ] `omni-cli ps` 中 `FaceResult` 发布者为板 IP
 - [ ] PC 端 3s 内收到 FaceResult（含 `det_count=0` 心跳帧）
