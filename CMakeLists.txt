@@ -106,6 +106,14 @@ if(EXISTS "${OMNIBINDER_ROOT}/include/omnibinder/omnibinder.h"
     target_include_directories(lvgl PUBLIC "${OMNIBINDER_ROOT}/include" "${IVS_GEN_DIR}")
     list(APPEND MAIN_LIBS "${OMNIBINDER_LIB}")
     add_compile_definitions(IVS_SRC_OMNIBINDER=1)
+    # 框架用 project(VERSION) 通过 compile definitions 注入版本宏（见 OmniBinder/CMakeLists.txt:69）。
+    # 我们只消费预编译的 libomnibinder.a，头文件里的 inline version() 仍需要这几个宏，故在此补齐。
+    # 升级框架时改这里，与 libomnibinder.a 的构建版本保持一致。
+    add_compile_definitions(
+        OMNIBINDER_VERSION="1.1.0"
+        OMNIBINDER_VERSION_MAJOR=1
+        OMNIBINDER_VERSION_MINOR=1
+        OMNIBINDER_VERSION_PATCH=0)
 else()
     message(STATUS "IVS: 未找到 OmniBinder → 仅编 mock 实现")
 endif()

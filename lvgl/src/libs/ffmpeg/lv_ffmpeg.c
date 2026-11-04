@@ -824,8 +824,14 @@ static struct ffmpeg_context_s * ffmpeg_open_file(const char * path, bool is_lv_
     /* open input file, and allocate format context */
 
     AVDictionary * open_opts = NULL;
-    av_dict_set(&open_opts, "stimeout", "5000000", 0);
-    av_dict_set(&open_opts, "timeout", "5000000", 0);
+    /* IVS-PATCH(1/2): 去掉 stimeout/timeout。
+     *   - stimeout 在 FFmpeg 8 已被移除（传了也只是被忽略）；
+     *   - timeout 在 RTSP 下会干扰会话，实测导致首个 av_read_frame 即 AVERROR_EOF。 */
+    (void)open_opts;
+    /* IVS-PATCH(2/2): RTSP 默认走 TCP。UDP 在项目网络下首包即 InvalidData（实测 H.264/HEVC 均如此）。 */
+    if(strncmp(path, "rtsp://", 7) == 0) {
+        av_dict_set(&open_opts, "rtsp_transport", "tcp", 0);
+    }
     if(avformat_open_input(&(ffmpeg_ctx->fmt_ctx), path, NULL, &open_opts) < 0) {
         av_dict_free(&open_opts);
         LV_LOG_ERROR("Could not open source file %s", path);

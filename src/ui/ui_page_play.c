@@ -143,15 +143,20 @@ static void do_play(const char * url)
     /* 绑定几何基准（播放器已在位） */
     ui_ivs_overlay_set_player(s_player);
 
-    /* 按当前码流的 host 连接识别服务；解析不出 host 就不启动会话 */
-    if(parse_rtsp_host(url, s_board_ip, sizeof(s_board_ip))) {
-        if(ivs_open(s_board_ip, APP_IVS_PORT, "face") != 0) {
-            lv_label_set_text(s_status_lbl, "ivs open failed");
+    /* 只有 RTSP 流才去连识别服务：本地文件/图片不启动会话（避免拿路径当 host） */
+    if(strncmp(url, "rtsp://", 7) == 0) {
+        if(parse_rtsp_host(url, s_board_ip, sizeof(s_board_ip))) {
+            if(ivs_open(s_board_ip, APP_IVS_PORT, "face") != 0) {
+                lv_label_set_text(s_status_lbl, "ivs open failed");
+            }
+        }
+        else {
+            s_board_ip[0] = '\0';
+            lv_label_set_text(s_status_lbl, "bad rtsp url (no host)");
         }
     }
     else {
         s_board_ip[0] = '\0';
-        lv_label_set_text(s_status_lbl, "bad rtsp url (no host)");
     }
 }
 
@@ -290,7 +295,11 @@ void ui_page_play_create(lv_obj_t * parent)
     ui_ivs_panel_set_retry_cb(retry_cb);
 
     ui_ivs_overlay_create();
-    ui_ivs_overlay_set_visible(true);
+    {
+        /* 开发用：APP_OSD=0 可关闭叠加层，便于隔离"遮挡/渲染"类问题 */
+        const char * osd_env = getenv("APP_OSD");
+        ui_ivs_overlay_set_visible(!(osd_env != NULL && osd_env[0] == '0'));
+    }
 
     s_tmr_panel = lv_timer_create(panel_timer_cb, 200, NULL);
     s_tmr_osd   = lv_timer_create(osd_timer_cb, 30, NULL);
