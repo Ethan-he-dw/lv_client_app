@@ -441,6 +441,27 @@ FACE_REGISTER_HOST=192.168.10.168 ./face_proc \
 | R1 | live2 拉流看 OSD | 框/名字/性能条正常（media_proc 订阅未受影响；走 SHM） |
 | R2 | `grep -E "data_connect_fallback|Service died" /var/log/media_ipc/media_proc.log`（或 `/tmp/media.log`） | 无新增 fallback（若出现，说明 SHM 异常，见风险 §7.2） |
 
+### 6.5 实测记录（2026-11-04 板测，已回填）
+
+| 步骤 | 实际输出 | 判定 |
+|------|---------|------|
+| **A. 不设 env（回滚安全性）** | | |
+| V1a | `[face] advertise host=<unset:127.0.0.1> (env FACE_REGISTER_HOST=unset)` | ✅ |
+| V2a | `Host: 127.0.0.1` / `Port: 35829` | ✅ 与改动前一致（零行为变更） |
+| **B. 设 `FACE_REGISTER_HOST=192.168.10.168`** | | |
+| V1b | `[face] advertise host=192.168.10.168 (env FACE_REGISTER_HOST=set)` | ✅ |
+| V2b | `Host: 192.168.10.168` / `Port: 41923`（动态数据面端口，非 9900） | ✅ **advertise 生效** |
+| **D4 框架日志** | `[I][OmniRuntimeService] service FaceService advertise 192.168.10.168:41923` | ✅ |
+| （旁证） | `[I][TcpClientTransport] Listening on 0.0.0.0:41923` | ✅ 监听通配 |
+| **D5 单实例锁** | 第二实例 `rc=4` + `[ERROR] another face_proc is running (lock held: /tmp/.face_proc.lock)` | ✅ |
+| D5 库工具不受影响 | `--gallery-list` → `rows=3, hzj 3 row(s)`，`rc=0` | ✅ **锁没误伤工具** |
+| **R1 板内回归** | `stat backend=fixed-rgn n=100 boxes=0 top_upd=301`；`topbar -> DEGRADED (stale=1)`（kill face_proc 后 2s） | ✅ OSD 正常、降级逻辑正常 |
+| **V4~V6（PC 端）** | ⏳ **待 PC 客户端程序就绪**（本方案不含 PC 代码；见对接文档） | 待办 |
+
+> 编译：`build=0`，0 error / 0 warning。
+> 提交：业务仓 `70ea309`（D1~D3+D5）、框架仓 `110934c`（D4）。
+> Patch：`docs/patches/0001-business-register-host.patch`、`docs/patches/0002-D4-opensource-advertise-log.patch`。
+
 ### 6.4 失败判定表
 
 | 现象 | 归属 | 处置 |

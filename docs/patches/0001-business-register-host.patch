@@ -1,0 +1,201 @@
+From 70ea309feaff05fab021410071ab810f278ade87 Mon Sep 17 00:00:00 2001
+From: Ethan-he-dw <15323253477@163.com>
+Date: Wed, 4 Nov 2026 09:39:21 +0800
+Subject: [PATCH] =?UTF-8?q?feat(face):=20advertise=20=E6=94=AF=E6=8C=81?=
+ =?UTF-8?q?=E8=B7=A8=E6=9C=BA(PLAN-REGISTER-HOST-20261104=20D1-D3+D5)?=
+ =?UTF-8?q?=E2=80=94=E2=80=94GetBoardAdvertiseIp=20=E8=AF=BB=20FACE=5FREGI?=
+ =?UTF-8?q?STER=5FHOST,=20=E5=9C=A8=20registerService=20=E4=B9=8B=E5=89=8D?=
+ =?UTF-8?q?=20setRegisterHost(=E6=9C=AA=E8=AE=BE=3D=E7=A9=BA=E4=B8=B2?=
+ =?UTF-8?q?=E9=80=80=E5=8C=96=E4=B8=BA127.0.0.1,=20=E8=A1=8C=E4=B8=BA?=
+ =?UTF-8?q?=E4=B8=8E=E6=94=B9=E5=8A=A8=E5=89=8D=E4=B8=80=E8=87=B4);=20?=
+ =?UTF-8?q?=E5=8A=A0=E5=BA=94=E7=94=A8=E4=BE=A7=20advertise=20=E6=97=A5?=
+ =?UTF-8?q?=E5=BF=97;=20face=5Fproc=20=E5=8A=A0=20single-instance=20flock(?=
+ =?UTF-8?q?=E5=88=86=E5=8F=91=E4=B9=8B=E5=90=8E=E6=8A=A2=E9=94=81,?=
+ =?UTF-8?q?=E5=BA=93=E5=B7=A5=E5=85=B7=E4=B8=8D=E5=8F=97=E5=BD=B1=E5=93=8D?=
+ =?UTF-8?q?;=20=E9=80=80=E5=87=BA=E7=A0=81=204=3D=E9=87=8D=E5=A4=8D?=
+ =?UTF-8?q?=E5=AE=9E=E4=BE=8B)?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+板测(192.168.10.168):
+- 不设 env: advertise host=<unset:127.0.0.1>, omni-cli Host=127.0.0.1 (证明零行为变更)
+- 设 env  : advertise host=192.168.10.168, omni-cli Host=192.168.10.168, Port=41923(动态数据面端口)
+- 单实例: 第二实例 rc=4 + "another face_proc is running"; --gallery-list rc=0 不受影响
+- 回归  : OSD stat backend=fixed-rgn 正常, topbar 降级逻辑正常
+---
+ apps/face_proc/main.cpp         | 26 +++++++++++++++
+ src/face_core/face_proc_app.cpp | 57 +++++++++++++++++++++++++++++++--
+ 2 files changed, 80 insertions(+), 3 deletions(-)
+
+diff --git a/apps/face_proc/main.cpp b/apps/face_proc/main.cpp
+index 096ec13..0a68bd0 100644
+--- a/apps/face_proc/main.cpp
++++ b/apps/face_proc/main.cpp
+@@ -12,8 +12,11 @@
+  *              配置装配）已拆分到 cli_options.*（纯解析/装配）与 gallery_tool.*（工具层）；
+  *              本文件只保留骨架，**禁止再放业务逻辑**。
+  *************************************************************************************************/
++#include <fcntl.h>      /* open */
+ #include <signal.h>
+ #include <stdio.h>
++#include <sys/file.h>   /* flock */
++#include <unistd.h>     /* close */
+ 
+ #include "cli_options.h"
+ #include "face_proc_app.h"
+@@ -23,6 +26,26 @@
+ static volatile sig_atomic_t g_run = 1;
+ static void OnSig(int) { g_run = 0; }
+ 
++/** 单实例锁（PLAN-REGISTER-HOST-20261104 D5）：防双实例同时注册同名 FaceService——
++ *  那会让 SM 里的 advertise 停留在旧实例（127.0.0.1），表现为"日志说设了、omni-cli 还是回环"。
++ *  与 media_proc 的 AcquireSingleInstanceLock 同构（apps/media_proc/main.cpp:35）。
++ *  @note flock 随进程退出（含 kill -9）由内核释放，不留陈旧锁；pidof/pgrep 判重有并发竞态。
++ *  @note 只在 kRun（识别/注册长驻模式）抢锁——库管理工具必须能在服务运行时执行。 */
++static int AcquireSingleInstanceLock() {
++    const char* kLockPath = "/tmp/.face_proc.lock";
++    const int fd = open(kLockPath, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
++    if (fd < 0) {
++        MIPC_LOG_ERROR("[face] open single-instance lock fail: %s", kLockPath);
++        return -1;
++    }
++    if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
++        MIPC_LOG_ERROR("[face] another face_proc is running (lock held: %s)", kLockPath);
++        (void)close(fd);
++        return -1;
++    }
++    return 0; /* fd 故意不关：随进程退出由内核释放 */
++}
++
+ int main(int argc, char **argv) {
+     mediaipc::FaceCliOptions opt;
+     if (mediaipc::ParseFaceCli(argc, argv, &opt) != 0) return 2;
+@@ -38,6 +61,9 @@ int main(int argc, char **argv) {
+     signal(SIGINT, OnSig);
+     signal(SIGTERM, OnSig);
+ 
++    /* 分发之后、初始化之前抢锁：库工具（--gallery-*）已在上面 return，不受影响 */
++    if (AcquireSingleInstanceLock() != 0) return 4;   /* 4 = 重复实例（0/1/2/3 各有语义，见文档） */
++
+     /* opt 必须活到 app 结束（Config 的 const char* 指向其内部字符串） */
+     const mediaipc::FaceProcApp::Config cfg = mediaipc::BuildFaceConfig(opt);
+     mediaipc::FaceProcApp app(cfg);
+diff --git a/src/face_core/face_proc_app.cpp b/src/face_core/face_proc_app.cpp
+index fc9ebd9..8473904 100644
+--- a/src/face_core/face_proc_app.cpp
++++ b/src/face_core/face_proc_app.cpp
+@@ -7,6 +7,7 @@
+ #include <unistd.h>
+ 
+ #include <cerrno>
++#include <cstdlib>   /* getenv（advertise host） */
+ 
+ #include "face_align.h"   /* kArcFaceDst/Umeyama2x3（dump 对拍记录用）；face_infer.h 未传递此头 */
+ #include "log.h"
+@@ -15,6 +16,20 @@
+ 
+ namespace {
+ 
++/** 读取"对外广告地址"：由部署脚本注入环境变量 FACE_REGISTER_HOST。
++ *
++ * 设计取舍（PLAN-REGISTER-HOST-20261104 §2.0 / §3.1）：
++ *  - 只做环境变量：板端网络由部署方预先配置好（固定 IP / 单网段），程序只消费一个明确地址；
++ *    不做自动探测、不判断网卡、不校验格式——网络可达性是部署前提（假设 A1/A2）。
++ *  - 未设置（或空串）⇒ 返回空串 ⇒ 框架退化为 127.0.0.1（= 改动前行为，板内不受影响）。
++ *  - 只在 Init 调用一次（结果存局部变量），运行期不再读环境，避免前后不一致。
++ */
++std::string GetBoardAdvertiseIp() {
++    const char* env = getenv("FACE_REGISTER_HOST");
++    if (env == nullptr || env[0] == '\0') return std::string();
++    return std::string(env);
++}
++
+ uint64_t NowUs() {
+     struct timespec ts;
+     clock_gettime(CLOCK_MONOTONIC, &ts);
+@@ -144,6 +159,17 @@ int FaceProcApp::Init() {
+         omni_mmz_sys_detach();
+         return -1;
+     }
++
++    /* 【PLAN-REGISTER-HOST-20261104 D2】advertise 地址：**必须在 registerService 之前**设置。
++     * advertise 在 startService 路径计算（runtime_service.cpp:79），注册后再设不会重新广告
++     * （SM 里仍是 127.0.0.1，表现为"日志说设了、omni-cli 还是回环"）。
++     * 未设置环境变量时传空串 ⇒ 框架退化为 127.0.0.1（与改动前行为完全一致）。 */
++    const std::string advertise_ip = GetBoardAdvertiseIp();
++    rt_.setRegisterHost(advertise_ip);
++    MIPC_LOG_INFO("[face] advertise host=%s (env FACE_REGISTER_HOST=%s)",
++                  advertise_ip.empty() ? "<unset:127.0.0.1>" : advertise_ip.c_str(),
++                  advertise_ip.empty() ? "unset" : "set");
++
+     rt_.registerService(&fsvc_);
+     fsvc_.PublishFaceResult();
+     fsvc_.SetReady(true);
+@@ -322,17 +348,39 @@ void FaceProcApp::InferOnce(const Job &job) {
+             last_drop_log_us_.store(now, std::memory_order_relaxed);
+             const uint64_t lp = last_pump_us_.load(std::memory_order_relaxed);
+             const uint64_t pump_gap_ms = (lp != 0ull && now > lp) ? (now - lp) / 1000ull : 0ull;
+-            MIPC_LOG_WARN("[face_proc] ring_drop=+%llu occ=%u/%u wait_ms=%u pump_gap_ms=%llu "
+-                          "since_start_ms=%llu",
++            /* ⚠️ 字段更名（REQ-BOARD2 §9-3）：原先叫 since_start_ms，但 NowUs() 是
++             * CLOCK_MONOTONIC ⇒ 它是**开机**起算，不是进程存活时长（实测差约 110s），
++             * 排障时会误读。改为 since_boot_ms，并补 proc_s（真正的本进程运行秒数）。 */
++            const uint64_t t0 = run_t0_us_.load(std::memory_order_relaxed);
++            const uint64_t proc_s = (t0 != 0ull && now > t0) ? (now - t0) / 1000000ull : 0ull;
++            /* 归因双指标（CONFI-T1e §3.4）：pump_gap 只测 T0 一侧，且天然落在 [0,一个迭代]，
++             * 33ms 二值分类信息量≈0 ⇒ 改为**同时记录两侧**，分布由 longrun 统计，不再分桶。 */
++            const uint64_t lr = last_release_us_.load(std::memory_order_relaxed);
++            const uint64_t la = last_acquire_us_.load(std::memory_order_relaxed);
++            const uint64_t rel_gap_ms = (lr != 0ull && now > lr) ? (now - lr) / 1000ull : 0ull;
++            const uint64_t t1_gap_ms = (la != 0ull && now > la) ? (now - la) / 1000ull : 0ull;
++            /* 字段语义（REQ-BOARD2 CONFI §4.1/§4.2 纠正后）：
++             *   occ_after  失败**之后**重新加锁读到的占用（T0 可能已释放）⇒ 仅参考，
++             *              不能用来判断"失败瞬间是否环满"（其实必然是满的：
++             *              AcquireForFill 只在全槽无 kFree 时才返回 false）；
++             *   wait_ms    = 本次取槽耗时，**含互斥锁竞争**；5ms 是 cv 单轮超时，
++             *              不是总时限（外层 for(;;) 无总 deadline）；
++             *   pump_gap_ms T0 距上次泵的间隔 ⇒ **这才是分桶依据**（≥33ms=T0 卡顿）。 */
++            MIPC_LOG_WARN("[face_proc] ring_drop=+%llu occ_after=%u/%u wait_ms=%u pump_gap_ms=%llu "
++                          "rel_gap_ms=%llu t1_gap_ms=%llu since_boot_ms=%llu proc_s=%llu",
+                           (unsigned long long)ndrop,
+                           (unsigned)(ring_ ? ring_->occupied() : 0u),
+                           (unsigned)(ring_ ? ring_->depth() : 0u), (unsigned)ring_wait_ms_.load(),
+                           (unsigned long long)pump_gap_ms,
+-                          (unsigned long long)(now / 1000ull));
++                          (unsigned long long)rel_gap_ms,
++                          (unsigned long long)t1_gap_ms,
++                          (unsigned long long)(now / 1000ull),
++                          (unsigned long long)proc_s);
+         }
+         rel_->enqueue(job.buffer_id);
+         return;
+     }
++    last_acquire_us_.store(NowUs(), std::memory_order_relaxed);   /* 取槽成功（T1 侧节奏） */
+ 
+     infer_stage_.store(kStageExec);
+     const int rc = finfer_.ExecStage(job, pool_.Slot(job.buffer_id).virt,
+@@ -530,6 +578,7 @@ bool FaceProcApp::ProcessPostStage() {
+     if (cfg_.enroll_name[0] != '\0') {
+         const bool consumed = EnrollOnce(slot);
+         ring_->Release(slot);
++        last_release_us_.store(NowUs(), std::memory_order_relaxed);
+         return consumed;
+     }
+     const uint64_t t0 = NowUs();
+@@ -542,10 +591,12 @@ bool FaceProcApp::ProcessPostStage() {
+         PublishNoFace(slot, t0);
+     }
+     ring_->Release(slot);
++    last_release_us_.store(NowUs(), std::memory_order_relaxed);
+     return true;
+ }
+ 
+ void FaceProcApp::Run() {
++    run_t0_us_.store(NowUs(), std::memory_order_relaxed);  /* §9-3：进程运行起点（区分 uptime） */
+     enroll_start_us_ = NowUs();
+     if (cfg_.enroll_name[0] != '\0') {
+         enroll_used_ = true;
+-- 
+2.34.1
+
