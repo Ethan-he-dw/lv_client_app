@@ -245,14 +245,23 @@ void lv_ffmpeg_player_set_cmd(lv_obj_t * obj, lv_ffmpeg_player_cmd_t cmd)
 
     switch(cmd) {
         case LV_FFMPEG_PLAYER_CMD_START:
-            av_seek_frame(player->ffmpeg_ctx->fmt_ctx,
-                          0, 0, AVSEEK_FLAG_BACKWARD);
+            /* IVS-PATCH(3/3): 只对可 seek 的输入（本地文件）做回绕。
+             * 直播流（RTSP）上 av_seek_frame 会让解复用器发送 PAUSE，
+             * 服务端暂停推流后，后续 av_read_frame 直接返回 AVERROR_EOF。 */
+            if(player->ffmpeg_ctx->fmt_ctx->pb != NULL &&
+               (player->ffmpeg_ctx->fmt_ctx->pb->seekable & AVIO_SEEKABLE_NORMAL)) {
+                av_seek_frame(player->ffmpeg_ctx->fmt_ctx,
+                              0, 0, AVSEEK_FLAG_BACKWARD);
+            }
             lv_timer_resume(timer);
             LV_LOG_INFO("ffmpeg player start");
             break;
         case LV_FFMPEG_PLAYER_CMD_STOP:
-            av_seek_frame(player->ffmpeg_ctx->fmt_ctx,
-                          0, 0, AVSEEK_FLAG_BACKWARD);
+            if(player->ffmpeg_ctx->fmt_ctx->pb != NULL &&
+               (player->ffmpeg_ctx->fmt_ctx->pb->seekable & AVIO_SEEKABLE_NORMAL)) {
+                av_seek_frame(player->ffmpeg_ctx->fmt_ctx,
+                              0, 0, AVSEEK_FLAG_BACKWARD);
+            }
             lv_timer_pause(timer);
             LV_LOG_INFO("ffmpeg player stop");
             break;
@@ -824,11 +833,11 @@ static struct ffmpeg_context_s * ffmpeg_open_file(const char * path, bool is_lv_
     /* open input file, and allocate format context */
 
     AVDictionary * open_opts = NULL;
-    /* IVS-PATCH(1/2): 去掉 stimeout/timeout。
-     *   - stimeout 在 FFmpeg 8 已被移除（传了也只是被忽略）；
-     *   - timeout 在 RTSP 下会干扰会话，实测导致首个 av_read_frame 即 AVERROR_EOF。 */
+    /* IVS-PATCH(1/3): 去掉 stimeout/timeout —— stimeout 在 FFmpeg 8 已移除，
+     * 且旧 timeout 语义与 RTSP 会话超时混用会干扰直播读取。 */
     (void)open_opts;
     /* IVS-PATCH(2/2): RTSP 默认走 TCP。UDP 在项目网络下首包即 InvalidData（实测 H.264/HEVC 均如此）。 */
+    /* IVS-PATCH(2/3): RTSP 默认走 TCP（UDP 在本项目网络下易丢首包/乱序） */
     if(strncmp(path, "rtsp://", 7) == 0) {
         av_dict_set(&open_opts, "rtsp_transport", "tcp", 0);
     }

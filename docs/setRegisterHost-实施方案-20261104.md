@@ -412,7 +412,14 @@ FACE_REGISTER_HOST=192.168.10.168 ./face_proc \
   > /tmp/face.log 2>&1 &   # 仅本地调试用；进程自身也会写 /var/log/media_ipc/face_proc.log
 ```
 
-> 如果现场用固定脚本起栈（`scripts/run_phase1_board.sh` 等），则在脚本里 export，不要每次手敲。
+> **自启动（重要）**：本板开机走 `/etc/init.d/S99mediaipc` → `scripts/board_run.sh start --ai=face --monitor`。
+> 该 env 已写入 `board_run.sh`（配置段默认 `192.168.10.168`，`launch()` 内仅对 face_proc 注入），
+> 因此**开机自启无需手工 export**；现场网段不同时改默认值或用 `FACE_REGISTER_HOST=x board_run.sh restart` 覆盖。
+> 验证过：`board_run.sh stop/start` 后 `omni-cli info` 的 Host 即为板 IP。
+
+> ⚠ **同步脚本的坑**：`board_run.sh` 从 Windows 工作区 tar 同步到 VM 时带 CRLF → shebang 变 `#!/bin/sh\r`
+> → 执行返回 **127（command not found）**。同步后必须 `sed -i 's/\r$//'`（仓库内已由 `.gitattributes`
+> 的 `*.sh text eol=lf` 保证 LF，问题只出在"绕过 git 直接传文件"这条路径上）。
 
 ---
 
@@ -456,6 +463,7 @@ FACE_REGISTER_HOST=192.168.10.168 ./face_proc \
 | **D5 单实例锁** | 第二实例 `rc=4` + `[ERROR] another face_proc is running (lock held: /tmp/.face_proc.lock)` | ✅ |
 | D5 库工具不受影响 | `--gallery-list` → `rows=3, hzj 3 row(s)`，`rc=0` | ✅ **锁没误伤工具** |
 | **R1 板内回归** | `stat backend=fixed-rgn n=100 boxes=0 top_upd=301`；`topbar -> DEGRADED (stale=1)`（kill face_proc 后 2s） | ✅ OSD 正常、降级逻辑正常 |
+| **自启动路径**（board_run.sh） | `stop_rc=0 start_rc=0`；`[board_run] ④ face_proc（advertise=192.168.10.168…）`；`Host: 192.168.10.168 Port: 33989` | ✅ **重启后仍生效**（不依赖手工 export） |
 | **V4~V6（PC 端）** | ⏳ **待 PC 客户端程序就绪**（本方案不含 PC 代码；见对接文档） | 待办 |
 
 > 编译：`build=0`，0 error / 0 warning。

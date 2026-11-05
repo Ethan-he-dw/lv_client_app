@@ -70,6 +70,7 @@ struct Session {
     std::atomic<bool>    stop{false};
     std::atomic<int>     state{IVS_IDLE};
     std::atomic<int64_t> last_rx_ms{0};
+    std::atomic<int64_t> t_sub_ms{0};     /* 进入 SUBSCRIBED 的时刻（用于"从未收到数据"的超时判定） */
     std::atomic<int>     last_err_code{0};
 
     omnibinder::OmniRuntime *rt{nullptr};
@@ -227,6 +228,7 @@ void ctl_main(Session *s)
             continue;
         }
 
+        s->t_sub_ms.store((int64_t)ivs_now_ms());
         s->state.store(IVS_SUBSCRIBED);
         return;                     /* ctl 使命完成，drv 继续泵事件 */
     }
@@ -293,9 +295,15 @@ ivs_state_t ob_state(void)
     if (s == NULL) return IVS_IDLE;
 
     const ivs_state_t st = (ivs_state_t)s->state.load();
-    if (st == IVS_STREAMING || st == IVS_SUBSCRIBED) {
+    const int64_t now = (int64_t)ivs_now_ms();
+    if (st == IVS_STREAMING) {
         const int64_t lr = s->last_rx_ms.load();
-        if (lr != 0 && ((int64_t)ivs_now_ms() - lr) > kNoDataMs) return IVS_NODATA;
+        if (lr != 0 && (now - lr) > kNoDataMs) return IVS_NODATA;
+    }
+    else if (st == IVS_SUBSCRIBED) {
+        /* 订阅成功但从未收到数据：同样算 NODATA（否则会永远停在"订阅中"） */
+        const int64_t ts = s->t_sub_ms.load();
+        if (ts != 0 && (now - ts) > kNoDataMs) return IVS_NODATA;
     }
     return st;
 }

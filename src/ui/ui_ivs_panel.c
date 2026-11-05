@@ -245,10 +245,15 @@ void ui_ivs_panel_refresh(void)
     /* 状态行：状态永远刷新（即使没有新帧），保证"链路死了"能被看见 */
     char sbuf[STATUS_BUF];
     if (st == IVS_NODATA) {
-        const uint64_t age_ms = (s_last_rx_ms != 0) ? (ivs_now_ms() - s_last_rx_ms) : 0;
-        snprintf(sbuf, sizeof(sbuf), "st=%s(%llus)  seq=%llu  objs=%u  rx=%u",
-                 ivs_state_str(st), (unsigned long long)(age_ms / 1000),
-                 (unsigned long long)s_last.seq, s_last.obj_count, s_rx_frames);
+        /* 从未收到过数据时没有"距上一帧"可算，只显示状态本身 */
+        if (s_last_rx_ms != 0) {
+            const uint64_t age_ms = ivs_now_ms() - s_last_rx_ms;
+            snprintf(sbuf, sizeof(sbuf), "st=%s(%llus)  seq=%llu  objs=%u  rx=%u",
+                     ivs_state_str(st), (unsigned long long)(age_ms / 1000),
+                     (unsigned long long)s_last.seq, s_last.obj_count, s_rx_frames);
+        } else {
+            snprintf(sbuf, sizeof(sbuf), "st=%s  (no data yet)  rx=0", ivs_state_str(st));
+        }
         dot_set(lv_color_hex(DOT_NODATA));
     } else if (st == IVS_FAILED) {
         const char *err = ivs_last_error();
