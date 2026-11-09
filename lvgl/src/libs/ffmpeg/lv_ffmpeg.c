@@ -795,13 +795,15 @@ static int ffmpeg_update_next_frame(struct ffmpeg_context_s * ffmpeg_ctx)
                 ffmpeg_ctx->sync_base_wall_ms = now_ms;
             }
             else {
-                const int64_t lag = (pts_ms - ffmpeg_ctx->sync_base_pts_ms)
-                                    - (now_ms - ffmpeg_ctx->sync_base_wall_ms);
-                if(lag > ffmpeg_sync_max_lag_ms()) {
+                /* IVS-FIX(2026-11-09): 落后量 = 墙钟已过 - 帧时间轴已过。
+                 * 之前写反（用 pts 减墙钟），恒为负 ⇒ 丢帧分支从未执行，延迟一路累积。 */
+                const int64_t behind = (now_ms - ffmpeg_ctx->sync_base_wall_ms)
+                                       - (pts_ms - ffmpeg_ctx->sync_base_pts_ms);
+                if(behind > ffmpeg_sync_max_lag_ms()) {
                     ffmpeg_ctx->drop_count++;
                     if((ffmpeg_ctx->drop_count % 30u) == 1u) {
-                        LV_LOG_WARN("live catch-up: drop frame lag=%lldms total=%u",
-                                    (long long)lag, (unsigned)ffmpeg_ctx->drop_count);
+                        LV_LOG_WARN("live catch-up: drop frame behind=%lldms total=%u",
+                                    (long long)behind, (unsigned)ffmpeg_ctx->drop_count);
                     }
                     continue;   /* 丢弃这一帧，继续追 */
                 }
@@ -899,14 +901,13 @@ static struct ffmpeg_context_s * ffmpeg_open_file(const char * path, bool is_lv_
     /* IVS-PATCH(1/3): 去掉 stimeout/timeout —— stimeout 在 FFmpeg 8 已移除，
      * 且旧 timeout 语义与 RTSP 会话超时混用会干扰直播读取。 */
     (void)open_opts;
-    /* IVS-PATCH(2/2): RTSP 默认走 TCP。UDP 在项目网络下首包即 InvalidData（实测 H.264/HEVC 均如此）。 */
-    /* IVS-PATCH(2/3): RTSP 传输可配，默认 UDP。
-     *   当初强制 TCP 是为了绕过"START 时误 seek 导致服务端 PAUSE → EOF"的缺陷，
-     *   该缺陷已由 IVS-PATCH(3/3) 修复，UDP 现在可正常收流。
-     *   TCP 会把积压留在内核缓冲（延迟不丢帧、只增不减），UDP 能自然丢弃旧数据。 */
+    /* IVS-PATCH(2/3): RTSP 传输可配，**默认 TCP**。
+     *   实测 UDP 在 1080p / 高码率下会因内核缓冲溢出丢包 → 解码缺 slice → 竖向条带花屏；
+     *   TCP 无丢包，代价是积压，但延迟已由 IVS-PATCH(4) 的追帧丢帧钳在 ~200ms。
+     *   需要低延迟且链路稳定时可用 IVS_RTSP_TRANSPORT=udp。 */
     if(strncmp(path, "rtsp://", 7) == 0) {
         const char * tr = getenv("IVS_RTSP_TRANSPORT");
-        av_dict_set(&open_opts, "rtsp_transport", (tr != NULL && tr[0] != '\0') ? tr : "udp", 0);
+        av_dict_set(&open_opts, "rtsp_transport", (tr != NULL && tr[0] != '\0') ? tr : "tcp", 0);
         av_dict_set(&open_opts, "fflags", "nobuffer", 0);   /* 不预缓冲，起播快、少攒帧 */
     }
     if(avformat_open_input(&(ffmpeg_ctx->fmt_ctx), path, NULL, &open_opts) < 0) {
