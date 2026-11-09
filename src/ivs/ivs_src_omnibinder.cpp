@@ -229,6 +229,14 @@ void ctl_main(Session *s)
         }
 
         s->t_sub_ms.store((int64_t)ivs_now_ms());
+        /* 诊断：板端注册的服务端点。若为回环，说明 setRegisterHost 没生效
+         * （板端二进制未重编 / 未设 FACE_REGISTER_HOST），跨机订阅必然失败。 */
+        fprintf(stderr, "[ivs] lookup %s -> host=%s port=%u\n",
+                s->bind->service, info.host.c_str(), (unsigned)info.port);
+        if (info.host == "127.0.0.1" || info.host == "::1" || info.host.empty()) {
+            set_err(s, 0, "板端 advertise=127.0.0.1（检查 FACE_REGISTER_HOST 与 face_proc 是否重编）");
+        }
+
         s->state.store(IVS_SUBSCRIBED);
         return;                     /* ctl 使命完成，drv 继续泵事件 */
     }
