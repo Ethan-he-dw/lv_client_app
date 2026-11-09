@@ -64,6 +64,11 @@ struct ffmpeg_context_s {
     bool has_alpha;
     lv_draw_buf_t draw_buf;
     lv_draw_buf_handlers_t draw_buf_handlers;
+    /* IVS-PATCH(4): 直播追帧同步（落后超过阈值即丢帧，避免延迟累积） */
+    bool     sync_base_set;
+    int64_t  sync_base_pts_ms;
+    int64_t  sync_base_wall_ms;
+    uint32_t drop_count;
 };
 
 #pragma pack(1)
@@ -572,7 +577,12 @@ static int ffmpeg_init_codec_context(AVCodecContext ** dec_ctx, const AVCodec * 
     }
 
     /* Init the decoders */
-    if((ret = avcodec_open2(*dec_ctx, dec, NULL)) < 0) {
+    /* IVS-PATCH(5): 直播用 low_delay，减少解码器内部重排缓冲 */
+    AVDictionary * dec_opts = NULL;
+    av_dict_set(&dec_opts, "flags", "+low_delay", 0);
+    ret = avcodec_open2(*dec_ctx, dec, &dec_opts);
+    av_dict_free(&dec_opts);
+    if(ret < 0) {
         LV_LOG_ERROR(
             "Failed to copy %s codec parameters to decoder context",
             av_get_media_type_string(type));
@@ -711,41 +721,94 @@ static int ffmpeg_get_frame_refr_period(struct ffmpeg_context_s * ffmpeg_ctx)
     return -1;
 }
 
+/* IVS-PATCH(4): 直播追帧参数
+ *   落后超过 MAX_LAG 即丢弃该帧继续读，最多连续追 CATCHUP 帧（避免饿死 UI/渲染）。 */
+#define FFMPEG_SYNC_MAX_LAG_MS   200   /* 默认阈值；可用 IVS_SYNC_MAX_LAG_MS 覆盖（现场调参/测试） */
+#define FFMPEG_SYNC_MAX_CATCHUP  8
+
+static int64_t ffmpeg_sync_max_lag_ms(void)
+{
+    static int64_t cached = -1;
+    if(cached < 0) {
+        const char * e = getenv("IVS_SYNC_MAX_LAG_MS");
+        cached = (e != NULL && e[0] != '\0') ? atoll(e) : FFMPEG_SYNC_MAX_LAG_MS;
+        if(cached <= 0) cached = FFMPEG_SYNC_MAX_LAG_MS;
+    }
+    return cached;
+}
+
+/** 包 pts → 毫秒（相对流时间轴）；不可用返回 AV_NOPTS_VALUE */
+static int64_t ffmpeg_pkt_pts_ms(const struct ffmpeg_context_s * ffmpeg_ctx,
+                                 const AVPacket * pkt)
+{
+    if(pkt->pts == AV_NOPTS_VALUE) return AV_NOPTS_VALUE;
+    const AVRational tb = ffmpeg_ctx->video_stream->time_base;
+    if(tb.num <= 0 || tb.den <= 0) return AV_NOPTS_VALUE;
+    return (int64_t)((pkt->pts * 1000LL * tb.num) / tb.den);
+}
+
 static int ffmpeg_update_next_frame(struct ffmpeg_context_s * ffmpeg_ctx)
 {
     int ret = 0;
 
-    while(1) {
+    /* 直播：一帧的输出速率被"流速率"钉死时，任何卡顿都会变成永久延迟。
+     * 这里允许一次 tick 连续读多帧，落后的帧直接丢弃（不写显示缓冲），
+     * 直到追平墙钟为止 —— 等价 ffplay 的 -framedrop。 */
+    for(int guard = 0; guard < FFMPEG_SYNC_MAX_CATCHUP; guard++) {
 
         /* read frames from the file */
-        if(av_read_frame(ffmpeg_ctx->fmt_ctx, ffmpeg_ctx->pkt) >= 0) {
-            bool is_image = false;
-
-            /* check if the packet belongs to a stream we are interested in,
-             * otherwise skip it
-             */
-            if(ffmpeg_ctx->pkt->stream_index == ffmpeg_ctx->video_stream_idx) {
-                ret = ffmpeg_decode_packet(ffmpeg_ctx->video_dec_ctx,
-                                           ffmpeg_ctx->pkt, ffmpeg_ctx);
-                is_image = true;
-            }
-
-            av_packet_unref(ffmpeg_ctx->pkt);
-
-            if(ret < 0) {
-                LV_LOG_WARN("video frame is empty %d", ret);
-                break;
-            }
-
-            /* Used to filter data that is not an image */
-            if(is_image) {
-                break;
-            }
-        }
-        else {
+        if(av_read_frame(ffmpeg_ctx->fmt_ctx, ffmpeg_ctx->pkt) < 0) {
             ret = -1;
             break;
         }
+
+        bool is_image = false;
+        int64_t pts_ms = AV_NOPTS_VALUE;
+
+        /* check if the packet belongs to a stream we are interested in,
+         * otherwise skip it */
+        if(ffmpeg_ctx->pkt->stream_index == ffmpeg_ctx->video_stream_idx) {
+            pts_ms = ffmpeg_pkt_pts_ms(ffmpeg_ctx, ffmpeg_ctx->pkt);
+            ret = ffmpeg_decode_packet(ffmpeg_ctx->video_dec_ctx,
+                                       ffmpeg_ctx->pkt, ffmpeg_ctx);
+            is_image = true;
+        }
+
+        av_packet_unref(ffmpeg_ctx->pkt);
+
+        if(ret < 0) {
+            LV_LOG_WARN("video frame is empty %d", ret);
+            break;
+        }
+
+        /* Used to filter data that is not an image */
+        if(!is_image) {
+            continue;
+        }
+
+        if(pts_ms != AV_NOPTS_VALUE) {
+            const int64_t now_ms = (int64_t)lv_tick_get();
+
+            if(!ffmpeg_ctx->sync_base_set) {
+                ffmpeg_ctx->sync_base_set = true;
+                ffmpeg_ctx->sync_base_pts_ms = pts_ms;
+                ffmpeg_ctx->sync_base_wall_ms = now_ms;
+            }
+            else {
+                const int64_t lag = (pts_ms - ffmpeg_ctx->sync_base_pts_ms)
+                                    - (now_ms - ffmpeg_ctx->sync_base_wall_ms);
+                if(lag > ffmpeg_sync_max_lag_ms()) {
+                    ffmpeg_ctx->drop_count++;
+                    if((ffmpeg_ctx->drop_count % 30u) == 1u) {
+                        LV_LOG_WARN("live catch-up: drop frame lag=%lldms total=%u",
+                                    (long long)lag, (unsigned)ffmpeg_ctx->drop_count);
+                    }
+                    continue;   /* 丢弃这一帧，继续追 */
+                }
+            }
+        }
+
+        break;              /* 已追平（或无需同步），本帧用于显示 */
     }
 
     return ret;
@@ -837,9 +900,14 @@ static struct ffmpeg_context_s * ffmpeg_open_file(const char * path, bool is_lv_
      * 且旧 timeout 语义与 RTSP 会话超时混用会干扰直播读取。 */
     (void)open_opts;
     /* IVS-PATCH(2/2): RTSP 默认走 TCP。UDP 在项目网络下首包即 InvalidData（实测 H.264/HEVC 均如此）。 */
-    /* IVS-PATCH(2/3): RTSP 默认走 TCP（UDP 在本项目网络下易丢首包/乱序） */
+    /* IVS-PATCH(2/3): RTSP 传输可配，默认 UDP。
+     *   当初强制 TCP 是为了绕过"START 时误 seek 导致服务端 PAUSE → EOF"的缺陷，
+     *   该缺陷已由 IVS-PATCH(3/3) 修复，UDP 现在可正常收流。
+     *   TCP 会把积压留在内核缓冲（延迟不丢帧、只增不减），UDP 能自然丢弃旧数据。 */
     if(strncmp(path, "rtsp://", 7) == 0) {
-        av_dict_set(&open_opts, "rtsp_transport", "tcp", 0);
+        const char * tr = getenv("IVS_RTSP_TRANSPORT");
+        av_dict_set(&open_opts, "rtsp_transport", (tr != NULL && tr[0] != '\0') ? tr : "udp", 0);
+        av_dict_set(&open_opts, "fflags", "nobuffer", 0);   /* 不预缓冲，起播快、少攒帧 */
     }
     if(avformat_open_input(&(ffmpeg_ctx->fmt_ctx), path, NULL, &open_opts) < 0) {
         av_dict_free(&open_opts);
