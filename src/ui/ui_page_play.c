@@ -27,7 +27,10 @@ static lv_timer_t * s_tmr_osd;
 static char g_av_err[256];
 static char s_board_ip[64];            /* 当前会话的板端 IP（重试用） */
 static bool s_fullscreen = false;
-static bool s_restore_panel_after_fs = false;  /* 全屏前暂存；退出全屏时消费一次 */
+/* 面板显隐拆成两个独立概念，避免互相覆盖：
+ *   s_panel_user_visible —— 用户想不想看面板（只由 Data 按钮改）
+ *   全屏时临时隐藏面板，但不修改用户选择；退出全屏按用户选择恢复。 */
+static bool s_panel_user_visible = true;
 
 /* ---------------- 工具 ---------------- */
 
@@ -68,22 +71,16 @@ static void apply_player_layout(void)
         int32_t sh = lv_display_get_vertical_resolution(lv_display_get_default());
         lv_obj_set_pos(s_player, 0, 0);
         lv_obj_set_size(s_player, sw, sh);
-        if(!s_restore_panel_after_fs) {             /* 只在"进入全屏"这一刻记录 */
-            s_restore_panel_after_fs = ui_ivs_panel_is_visible();
-        }
-        ui_ivs_panel_set_visible(false);            /* 全屏时不遮画面 */
+        ui_ivs_panel_set_visible(false);            /* 临时隐藏，不改用户选择 */
     }
     else {
         lv_area_t ca;
         lv_obj_get_content_coords(s_page, &ca);
+        /* 必须先恢复面板再算宽度：否则 video_width() 按"面板隐藏"算，
+         * 播放器会一直保持全宽，面板虽然显示但被压在下面（退出全屏时的旧问题） */
+        ui_ivs_panel_set_visible(s_panel_user_visible);
         lv_obj_set_pos(s_player, ca.x1, ca.y1 + APP_PLAYER_TOP);
         lv_obj_set_size(s_player, video_width(), APP_PLAYER_H);
-        /* 只恢复"因进入全屏而被隐藏"的那一次；
-         * 用户手动点 Data 的显隐不能被这里覆盖（否则按钮点击会被立刻撤销） */
-        if(s_restore_panel_after_fs) {
-            ui_ivs_panel_set_visible(true);
-            s_restore_panel_after_fs = false;
-        }
     }
 }
 
@@ -103,7 +100,9 @@ static void player_dbl_cb(lv_event_t * e)
 {
     (void)e;
     s_fullscreen = !s_fullscreen;
-    apply_player_layout();
+    apply_player_layout();              /* 内部处理面板隐藏/恢复，不要在这里再 toggle */
+    LV_LOG("dblclick: fullscreen=%d", (int)s_fullscreen);
+
     lv_label_set_text(s_status_lbl, s_fullscreen ? "fullscreen, dbl-click to restore" : "playing");
 }
 
@@ -196,8 +195,8 @@ static void stop_btn_cb(lv_event_t * e)
 static void data_btn_cb(lv_event_t * e)
 {
     (void)e;
-    if(s_fullscreen) return;
-    ui_ivs_panel_toggle();
+    if(s_fullscreen) return;            /* 全屏中不改用户选择，退出后自然恢复 */
+    s_panel_user_visible = !s_panel_user_visible;
     apply_player_layout();              /* 面板显隐改变播放器可用宽度 */
 }
 

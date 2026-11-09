@@ -71,6 +71,7 @@ void ui_ivs_overlay_create(void)
         lv_obj_set_style_border_color(b, lv_color_hex(s_styles[IVS_TASK_FACE].box), 0);
         lv_obj_set_style_radius(b, 0, 0);
         lv_obj_set_hidden(b, true);
+        lv_obj_set_clickable(b, false);   /* 不吃点击：否则光标落在人脸框上时播放器收不到双击 */
         s_box[i] = b;
     }
 
@@ -82,11 +83,13 @@ void ui_ivs_overlay_create(void)
         lv_obj_set_style_bg_color(d, lv_color_hex(s_styles[IVS_TASK_FACE].kps), 0);
         lv_obj_set_style_bg_opa(d, LV_OPA_COVER, 0);
         lv_obj_set_hidden(d, true);
+        lv_obj_set_clickable(d, false);   /* 同上：关键点也不能吃点击 */
         s_dot[i] = d;
     }
 
     s_name = lv_label_create(s_cont);
     lv_label_set_text(s_name, "");
+    lv_obj_set_clickable(s_name, false);  /* 同上：姓名标签 */
     lv_obj_set_style_text_font(s_name, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(s_name, lv_color_hex(0xFFFFFF), 0);
     lv_obj_set_style_bg_color(s_name, lv_color_hex(0x000000), 0);
