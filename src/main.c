@@ -60,6 +60,11 @@ int main(int argc, char **argv)
   (void)argc; /*Unused*/
   (void)argv; /*Unused*/
 
+  /* 视频放大采样必须用线性过滤：LVGL 的 SDL 后端未设置 SDL_HINT_RENDER_SCALE_QUALITY，
+   * 默认是 nearest，会把 640x360 的流放大到播放器尺寸后呈现明显块状边缘。
+   * 必须在窗口/渲染器创建（sdl_hal_init）之前设置。 */
+  SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "linear");
+
   /*Initialize LVGL*/
   lv_init();
 

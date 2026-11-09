@@ -27,7 +27,7 @@ static lv_timer_t * s_tmr_osd;
 static char g_av_err[256];
 static char s_board_ip[64];            /* 当前会话的板端 IP（重试用） */
 static bool s_fullscreen = false;
-static bool s_panel_was_visible = true;
+static bool s_restore_panel_after_fs = false;  /* 全屏前暂存；退出全屏时消费一次 */
 
 /* ---------------- 工具 ---------------- */
 
@@ -68,7 +68,9 @@ static void apply_player_layout(void)
         int32_t sh = lv_display_get_vertical_resolution(lv_display_get_default());
         lv_obj_set_pos(s_player, 0, 0);
         lv_obj_set_size(s_player, sw, sh);
-        s_panel_was_visible = ui_ivs_panel_is_visible();
+        if(!s_restore_panel_after_fs) {             /* 只在"进入全屏"这一刻记录 */
+            s_restore_panel_after_fs = ui_ivs_panel_is_visible();
+        }
         ui_ivs_panel_set_visible(false);            /* 全屏时不遮画面 */
     }
     else {
@@ -76,7 +78,12 @@ static void apply_player_layout(void)
         lv_obj_get_content_coords(s_page, &ca);
         lv_obj_set_pos(s_player, ca.x1, ca.y1 + APP_PLAYER_TOP);
         lv_obj_set_size(s_player, video_width(), APP_PLAYER_H);
-        if(s_panel_was_visible) ui_ivs_panel_set_visible(true);
+        /* 只恢复"因进入全屏而被隐藏"的那一次；
+         * 用户手动点 Data 的显隐不能被这里覆盖（否则按钮点击会被立刻撤销） */
+        if(s_restore_panel_after_fs) {
+            ui_ivs_panel_set_visible(true);
+            s_restore_panel_after_fs = false;
+        }
     }
 }
 
